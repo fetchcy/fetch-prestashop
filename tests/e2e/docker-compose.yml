@@ -1,0 +1,39 @@
+# Local PrestaShop 8.1 + MariaDB for the e2e test (node tests/e2e/run.mjs).
+# MODULE_DIR lets the runner mount the unzipped release instead of the source.
+name: fetchsync-e2e
+services:
+  db:
+    image: mariadb:10.11
+    environment:
+      MYSQL_ROOT_PASSWORD: admin
+      MYSQL_DATABASE: prestashop
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      retries: 30
+  prestashop:
+    image: ${PS_IMAGE:-prestashop/prestashop:8.1}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${PS_PORT:-8088}:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DB_SERVER: db
+      DB_NAME: prestashop
+      DB_USER: root
+      DB_PASSWD: admin
+      DB_PREFIX: ps_
+      PS_INSTALL_AUTO: "1"
+      PS_DOMAIN: localhost:${PS_PORT:-8088}
+      PS_FOLDER_ADMIN: admin-dev
+      PS_FOLDER_INSTALL: install-dev
+      PS_COUNTRY: CY
+      PS_LANGUAGE: en
+      ADMIN_MAIL: admin@example.com
+      ADMIN_PASSWD: fetch-e2e-admin
+    volumes:
+      - ${MODULE_DIR:-../../fetchsync}:/var/www/html/modules/fetchsync
+      - ./:/var/www/html/fetchsync-e2e:ro
