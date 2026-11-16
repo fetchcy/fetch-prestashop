@@ -19,6 +19,7 @@ It uses the [Fetch Partner API](https://developer.fetch.com.cy) and works the sa
 - **Instant order alerts with a safety net.** Orders arrive within seconds through a signed webhook, and the module also checks every 2 minutes so nothing is missed.
 - **Optional auto-accept** with your usual preparation time.
 - **Optional price markup** for the prices you show on Fetch.
+- **Optional mirror mode** that keeps your Fetch store to exactly the products this shop sells, with a preview and a safety check before anything is switched off.
 
 ## Requirements
 
@@ -34,7 +35,7 @@ It uses the [Fetch Partner API](https://developer.fetch.com.cy) and works the sa
 
 1. Ask Fetch for a **Partner API key** for your store.
    You receive a **client ID** and a **client secret**.
-2. In the back office, go to **Modules → Module Manager → Upload a module** and upload `fetchsync-1.0.0.zip`.
+2. In the back office, go to **Modules → Module Manager → Upload a module** and upload `fetchsync-1.1.0.zip`.
    PrestaShop installs it.
 3. Press **Configure** on the **Fetch** module.
 4. Enter your client ID and client secret, press **Save settings**, then press **Connect & load stores** and choose your Fetch store.
@@ -62,6 +63,7 @@ Do not delete the carrier or the product; the module uses them to build Fetch or
 | Fetch store | The Fetch store your products and orders belong to. Filled in by **Connect & load stores**. |
 | Sync to Fetch | Turns automatic product, price and stock sync on or off. |
 | Price markup (%) | Added to every price and sale price sent to Fetch, for example `10` sends a €10.00 product as €11.00. Your PrestaShop prices are not changed. Accepts 0 to 100 with up to two decimals (`12,5` and `15 %` are accepted). The VAT-inclusive price is rounded to the cent first, then the markup is added and rounded half up (9.99 at 15% is 11.49). Stock is never affected. Changing the markup resends all products to Fetch. Imported Fetch orders keep the prices the customer paid on Fetch. |
+| Catalogue mode | **Add and update only** (the default) sends this shop's products and never touches the other products in your Fetch store. **Mirror this shop 1:1** also switches off, at the end of every full sync, the products in your Fetch store that this shop does not sell. See [Mirror this shop 1:1](#mirror-this-shop-11). **Preview** shows what it would switch off, without changing anything. |
 | Import Fetch orders | Turns order import on or off. |
 | Auto-accept | Accepts new Fetch orders automatically, using the preparation time below. |
 | Preparation time | Minutes you need to prepare an order (0–180). The courier is booked to collect after this. |
@@ -119,6 +121,39 @@ A combination only uses its own barcode, never the product's.
 - If Fetch cannot be reached, or answers `429 Too Many Requests`, the products stay queued and are retried later (after `Retry-After`, then 2, 4, 8 … minutes, at most hourly).
 - A sale that starts or ends on a date is picked up by the next cron run after that date.
 - The configuration page shows how many changes are waiting, and **Recent activity** shows each batch.
+
+### Mirror this shop 1:1
+
+With **Catalogue mode** set to **Mirror this shop 1:1**, your Fetch store ends up with exactly the products this shop syncs.
+Products in your Fetch store that aren't in this shop are switched off on Fetch (not deleted).
+Prices and stock always follow this shop.
+
+At the end of every full sync (**Sync all products now**, or the resend after a price markup change), the module reads every product in your Fetch store and switches off the ones that are not on sale in this shop:
+
+- Fetch products without a reference, for example ones added in the Fetch merchant portal;
+- Fetch products whose reference is not one of this shop's references;
+- packs and virtual products, which the module does not sync;
+- products that are disabled, not visible, not available for order or deleted in this shop.
+
+Nothing is ever deleted.
+Switching a product off is reversible: when the product is on sale in this shop again, the normal sync switches it back on.
+
+"1:1" means which products are on sale, their price, their stock and whether they are active.
+Product names, photos and descriptions live in Fetch's shared catalogue, which other stores use too, so the module does not overwrite them.
+
+Safety:
+
+- **Preview** (under **Products**) shows "N of M Fetch products would be switched off", with up to 20 of their names.
+  It changes nothing, and works before you turn mirror mode on.
+- Mirroring runs only after a full sync in which every request reached Fetch.
+  Products Fetch refused one by one do not stop it.
+  If any page of your Fetch products cannot be read, nothing is switched off.
+- If a run would switch off more than half of your active Fetch products, nothing is switched off.
+  The module logs it and shows a notice on its configuration page.
+  Check the preview, then press **Apply anyway** to apply it once.
+- Every run is logged under **Recent activity**: listings scanned, kept, switched off, and errors.
+- Products are switched off in requests of at most 200 rows and under 500 KB, each with the product's current Fetch price, as the live API requires.
+  Single-product changes (a save, a stock change) never trigger a mirror run.
 
 ## How orders work
 
@@ -211,6 +246,8 @@ Other shops of a multistore installation are not synced.
 | Webhook returns 401 | Press **Register webhook** again to refresh the signing secret, and check the server clock. |
 | An order line shows "not in your catalogue" | The Fetch item's reference matches no product or combination reference. Its stock was not reduced. |
 | Changes wait in the queue | Fetch was unreachable or rate-limited the shop; the next cron run retries. |
+| "Mirror held" in Recent activity | The run would have switched off more than half of your active Fetch products. Press **Preview** to check the list, then **Apply anyway** in the notice at the top of the module page. |
+| "Mirror skipped" in Recent activity | Fetch could not be reached during the full sync or while reading your Fetch products, so nothing was switched off. Run **Sync all products now** again. |
 
 ## Data and privacy
 
@@ -228,13 +265,13 @@ Other shops of a multistore installation are not synced.
 php tests/unit.php
 
 # Build the module ZIP (fetchsync/ at the zip root)
-./build.sh            # → dist/fetchsync-1.0.0.zip
+./build.sh            # → dist/fetchsync-1.1.0.zip
 
 # End-to-end: PrestaShop 8.1 + MariaDB in Docker, the release ZIP, and a mock Fetch API
 node tests/e2e/run.mjs
 ```
 
-See [tests/README.md](tests/README.md) for details.
+See [tests/README.md](tests/README.md) for details, and [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
 
 ## Support
 

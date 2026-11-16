@@ -128,7 +128,7 @@ try {
   cronToken = new URL(cfg.cron_url).searchParams.get('token');
   let log = mockLog();
   ok('token request is client_credentials', log.requests.some((r) => r.path === '/api/v1/oauth/token' && r.body?.grant_type === 'client_credentials' && r.body?.client_id === 'client-1'));
-  ok('User-Agent identifies the module', log.requests.some((r) => /^FetchForPrestaShop\/1\.0\.0/.test(r.ua || '')), log.requests.at(-1)?.ua);
+  ok('User-Agent identifies the module', log.requests.some((r) => /^FetchForPrestaShop\/1\.1\.0/.test(r.ua || '')), log.requests.at(-1)?.ua);
 
   // --- Products ---------------------------------------------------------------
   const prod = await step('create_products');
