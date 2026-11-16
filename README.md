@@ -234,3 +234,8 @@ See [tests/README.md](tests/README.md) for details.
 ## Support
 
 Contact Fetch merchant support.
+
+## License
+
+Academic Free License 3.0 (AFL-3.0), the usual license for PrestaShop modules.
+See [LICENSE](LICENSE).
