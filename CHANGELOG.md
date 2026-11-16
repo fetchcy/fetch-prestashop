@@ -11,6 +11,7 @@
 - A mirror run that would switch off more than half of the store's active products waits for **Apply anyway**.
   A run is skipped when the full sync could not reach Fetch or a page of the store's products could not be read.
 - Every mirror run is logged under **Recent activity**: scanned, kept, switched off and errors.
+- Every product push now carries a fresh Idempotency-Key instead of a hash of its content, so the Fetch sandbox can no longer replay an old answer when the same product data is sent again.
 
 ## 1.0.0 (beta)
 

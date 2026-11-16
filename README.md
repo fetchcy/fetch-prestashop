@@ -152,7 +152,7 @@ Safety:
   The module logs it and shows a notice on its configuration page.
   Check the preview, then press **Apply anyway** to apply it once.
 - Every run is logged under **Recent activity**: listings scanned, kept, switched off, and errors.
-- Products are switched off in requests of at most 200 rows and under 500 KB, each with the product's current Fetch price, as the live API requires.
+- Products are switched off by their Fetch listing ID, in requests of at most 200 rows and under 500 KB, each with the product's current Fetch price, as the live API requires.
   Single-product changes (a save, a stock change) never trigger a mirror run.
 
 ## How orders work

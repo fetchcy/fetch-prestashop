@@ -351,8 +351,9 @@ try {
   const rows = batches.flatMap((r) => r.body.items);
   ok('mirror on: the scan pages through every listing with limit 500 and nextCursor', scans.length === Math.ceil(L.length / 7) && scans.every((r, i) => r.query.limit === '500' && (i === 0) === !r.query.cursor), scans.map((r) => r.query));
   ok('mirror on: the extra, no-ref, filtered-out and deleted listings are switched off', foreign.every((r) => listingByRef(L, r)?.isActive === false) && L.find((l) => l.listingId === noRef.listingId).isActive === false, L.filter((l) => foreign.includes(l.ref) || !l.ref));
-  ok('mirror on: rows by ref, or by listingId without one, each with the current price and isActive false', rows.length === 4 && rows.every((x) => x.isActive === false && /^\d+\.\d{2}$/.test(x.price) && Object.keys(x).filter((k) => ['ref', 'listingId', 'barcode'].includes(k)).length === 1) && rows.some((x) => x.listingId === noRef.listingId && x.price === '15.00') && rows.some((x) => x.ref === 'OLD-1' && x.price === '30.00'), rows);
-  ok('mirror on: the shop\'s products stay on sale; already-off listings are not touched', ['CBL-001', 'CASE-BLACK', 'CASE-WHITE'].every((r) => listingByRef(L, r)?.isActive === true) && !rows.some((x) => x.ref === 'OLD-2'), L.filter((l) => l.ref?.startsWith('C')));
+  const oldOne = listingByRef(L, 'OLD-1');
+  ok('mirror on: rows always by the scanned listingId (never ref), each with the current price and isActive false', rows.length === 4 && rows.every((x) => x.isActive === false && /^\d+\.\d{2}$/.test(x.price) && typeof x.listingId === 'string' && x.ref === undefined && x.barcode === undefined) && rows.some((x) => x.listingId === noRef.listingId && x.price === '15.00') && rows.some((x) => x.listingId === oldOne?.listingId && x.price === '30.00'), rows);
+  ok('mirror on: the shop\'s products stay on sale; already-off listings are not touched', ['CBL-001', 'CASE-BLACK', 'CASE-WHITE'].every((r) => listingByRef(L, r)?.isActive === true) && !rows.some((x) => x.listingId === listingByRef(L, 'OLD-2')?.listingId), L.filter((l) => l.ref?.startsWith('C')));
   ok('mirror on: run logged with scanned, kept, switched off and errors', fs3.activity.some((a) => new RegExp(`^Mirror: scanned ${L.length} Fetch listing\\(s\\), kept \\d+, switched off 4, 0 error\\(s\\)\\.$`).test(a)) && batches.every((r) => !!r.idem), fs3.activity);
   ok('listings/batch requests pass the mock\'s live rules', mockLog().problems.length === 0, mockLog().problems);
 
@@ -383,6 +384,9 @@ try {
   ok(`batching: ${extra} rows go in requests of at most 200`, applied.length === Math.ceil(extra / 200) && applied.every((r) => r.body.items.length <= 200) && applied.reduce((n, r) => n + r.body.items.length, 0) === extra && new Set(applied.map((r) => r.idem)).size === applied.length, applied.map((r) => r.body.items.length));
   ok('the shop\'s products are still on sale after "Apply anyway"', ['CBL-001', 'CASE-BLACK', 'GIFT-CARD'].every((r) => listingByRef(L, r)?.isActive === true), ['CBL-001', 'CASE-BLACK', 'GIFT-CARD'].map((r) => listingByRef(L, r)));
   ok('all listings/batch requests still pass the mock\'s live rules', mockLog().problems.length === 0, mockLog().problems);
+  const allPuts = mockLog().requests.filter((r) => r.method === 'PUT' && r.path.endsWith('/products'));
+  const bodies = allPuts.map((r) => JSON.stringify(r.body));
+  ok('every product push has its own idempotency key, even when the payload repeats', allPuts.every((r) => /^ps-[0-9a-f]{32}$/.test(r.idem || '')) && new Set(allPuts.map((r) => r.idem)).size === allPuts.length && new Set(bodies).size < bodies.length, { puts: allPuts.length, keys: new Set(allPuts.map((r) => r.idem)).size, distinctBodies: new Set(bodies).size });
 } catch (e) {
   console.error('E2E ERROR', e);
   results.push(['FAIL', 'runner error: ' + e.message]);

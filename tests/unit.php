@@ -324,7 +324,7 @@ class FakeFetchApi
     public $listings = array();
     public $pageSize = 2;
     public $failPage = null;
-    public $rejectRefs = array();
+    public $rejectIds = array();
     public $failBatches = false;
     public $pages = array();
     public $batches = array();
@@ -355,13 +355,13 @@ class FakeFetchApi
         $results = array();
         $rejected = 0;
         foreach ($items as $item) {
-            $ref = isset($item['ref']) ? $item['ref'] : null;
-            if (null !== $ref && in_array($ref, $this->rejectRefs, true)) {
+            $id = isset($item['listingId']) ? $item['listingId'] : null;
+            if (in_array($id, $this->rejectIds, true)) {
                 ++$rejected;
-                $results[] = array('ref' => $ref, 'listingId' => null, 'status' => 'error', 'code' => 'ref_not_found', 'message' => 'No listing matches');
+                $results[] = array('ref' => null, 'listingId' => $id, 'status' => 'error', 'code' => 'not_permitted', 'message' => 'Listing is locked');
                 continue;
             }
-            $results[] = array('ref' => $ref, 'listingId' => isset($item['listingId']) ? $item['listingId'] : 'lst-' . $ref, 'status' => 'updated');
+            $results[] = array('ref' => null, 'listingId' => $id, 'status' => 'updated');
         }
 
         return array('code' => 201, 'body' => array('accepted' => count($items) - $rejected, 'rejected' => $rejected, 'results' => $results), 'error' => null, 'retry_after' => null);
@@ -372,7 +372,7 @@ class FakeFetchApi
         $out = array();
         foreach ($this->batches as $batch) {
             foreach ($batch['items'] as $item) {
-                $out[] = isset($item['ref']) ? $item['ref'] : $item['listingId'];
+                $out[] = $item['listingId'];
             }
         }
 
@@ -438,11 +438,11 @@ check('mirror on: scan pages with limit 500 and follows nextCursor', array_map(f
     return isset($q['cursor']) ? $q['limit'] . '@' . $q['cursor'] : $q['limit'] . '@';
 }, $api->pages), array('500@', '500@2', '500@4', '500@6', '500@8'));
 check('mirror on: counts (scanned once per listing, active, kept)', array($run['scanned'], $run['active'], $run['kept'], $run['off']), array(8, 6, 4, 3));
-check('mirror on: switches off the no-ref, filtered-out and gone listings only', $api->switchedOff(), array('lst-c', 'GIFT', 'OLD-9'));
-check('mirror on: rows carry the current price and isActive false; no ref → listingId', $api->batches[0]['items'], array(
+check('mirror on: switches off the no-ref, filtered-out and gone listings only', $api->switchedOff(), array('lst-c', 'lst-g', 'lst-o'));
+check('mirror on: rows by the scanned listingId (never ref), with the current price and isActive false', $api->batches[0]['items'], array(
     array('listingId' => 'lst-c', 'price' => '4.50', 'isActive' => false),
-    array('ref' => 'GIFT', 'price' => '25.00', 'isActive' => false),
-    array('ref' => 'OLD-9', 'price' => '7.99', 'isActive' => false),
+    array('listingId' => 'lst-g', 'price' => '25.00', 'isActive' => false),
+    array('listingId' => 'lst-o', 'price' => '7.99', 'isActive' => false),
 ));
 check('mirror on: one row identifier each (live refuses ambiguous rows)', count(array_filter($api->batches[0]['items'], function ($row) {
     return 1 !== count(array_intersect_key($row, array('ref' => 1, 'listingId' => 1, 'barcode' => 1)));
@@ -450,11 +450,13 @@ check('mirror on: one row identifier each (live refuses ambiguous rows)', count(
 check('mirror on: batch sent to the configured store with an idempotency key', $api->batches[0]['store'] === 'store-1' && 0 === strpos($api->batches[0]['key'], 'ps-mirror-'), true);
 check('mirror on: result', array($run['switched_off'], $run['errors']), array(3, 0));
 check('mirror on: run logged with scanned, kept, switched off, errors', logged('/^info: Mirror: scanned 8 Fetch listing\(s\), kept 4, switched off 3, 0 error\(s\)\.$/'), 1);
-check('a listing the shop sells that is off on Fetch is left alone (the normal sync switches it back on)', in_array('A-4', $api->switchedOff(), true), false);
+check('a listing the shop sells that is off on Fetch is left alone (the normal sync switches it back on)', in_array('lst-4', $api->switchedOff(), true), false);
 
 $again = new FakeFetchApi($store);
 FetchSyncMirror::run(false, $again, $keep);
 check('a later run with the same rows uses a new idempotency key (sandbox replays keys)', $again->batches[0]['key'] !== $api->batches[0]['key'], true);
+check('product push: a fresh idempotency key per request, not a hash of the payload', preg_match('/^ps-[0-9a-f]{32}$/', FetchSyncProductSync::idempotencyKey()) && FetchSyncProductSync::idempotencyKey() !== FetchSyncProductSync::idempotencyKey(), true);
+check('mirror: keys carry their own prefix', 0 === strpos(FetchSyncProductSync::idempotencyKey('ps-mirror-'), 'ps-mirror-'), true);
 
 mirrorReset('mirror');
 $api = new FakeFetchApi($store);
@@ -483,7 +485,7 @@ check('guard: held run logged', logged('/^error: Mirror held: it would switch of
 $api = new FakeFetchApi($store);
 $run = FetchSyncMirror::run(true, $api, $few);
 check('Apply anyway: applied despite the guard', array($run['status'], $run['switched_off']), array('done', 5));
-check('Apply anyway: switches off everything the shop does not sell', $api->switchedOff(), array('A-2', 'A-3', 'lst-c', 'GIFT', 'OLD-9'));
+check('Apply anyway: switches off everything the shop does not sell', $api->switchedOff(), array('lst-2', 'lst-3', 'lst-c', 'lst-g', 'lst-o'));
 check('Apply anyway: pending run cleared', FetchSyncMirror::pending(), null);
 
 // Preview: counts and up to 20 names, changes nothing.
@@ -534,7 +536,7 @@ check('batching: 450 rows → requests of 200, 200, 50', array_map(function ($b)
 }, $api->batches), array(200, 200, 50));
 check('batching: every request under 450 KB', max(array_column($api->batches, 'bytes')) < 450000, true);
 check('batching: two scan pages of at most 500', count($api->pages), 2);
-check('batching: all 450 switched off, none of the shop\'s', array($run['switched_off'], $run['errors'], count(preg_grep('/^S-/', $api->switchedOff()))), array(450, 0, 0));
+check('batching: all 450 switched off, none of the shop\'s', array($run['switched_off'], $run['errors'], count(preg_grep('/^lst-s/', $api->switchedOff()))), array(450, 0, 0));
 $rows = array();
 for ($i = 0; $i < 150; ++$i) {
     $rows[] = array('ref' => 'R-' . $i, 'price' => '1.00', 'isActive' => false, 'pad' => str_repeat('x', 4000));
@@ -544,10 +546,10 @@ check('batching: large rows split by size too', array_map('count', FetchSyncProd
 // Errors.
 mirrorReset('mirror');
 $api = new FakeFetchApi($store);
-$api->rejectRefs = array('OLD-9');
+$api->rejectIds = array('lst-o');
 $run = FetchSyncMirror::run(false, $api, $keep);
 check('a refused row is an error, the rest are switched off', array($run['switched_off'], $run['errors']), array(2, 1));
-check('a refused row is logged with Fetch\'s reason', logged('/^error: Mirror: Fetch refused to switch off OLD-9: ref_not_found: No listing matches$/'), 1);
+check('a refused row is logged with Fetch\'s reason', logged('/^error: Mirror: Fetch refused to switch off lst-o: not_permitted: Listing is locked$/'), 1);
 check('a run with errors is logged as an error', logged('/^error: Mirror: scanned 8 Fetch listing\(s\), kept 4, switched off 2, 1 error\(s\)\.$/'), 1);
 $api = new FakeFetchApi($big);
 $api->pageSize = 500;

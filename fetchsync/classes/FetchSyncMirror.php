@@ -193,15 +193,15 @@ class FetchSyncMirror
     }
 
     /**
-     * listings/batch rows: by ref, or by listingId when the listing has none,
-     * with the current price (live Fetch requires one on every row).
+     * listings/batch rows, always by the scanned listingId (exact and scoped to
+     * the store, where a ref can fail to resolve), with the current price (live
+     * Fetch requires one on every row).
      */
     public static function rows(array $off)
     {
         $rows = array();
         foreach ($off as $listing) {
-            $ref = self::ref($listing);
-            $row = null !== $ref ? array('ref' => $ref) : array('listingId' => (string) $listing['listingId']);
+            $row = array('listingId' => (string) $listing['listingId']);
             if (isset($listing['price'])) {
                 $row['price'] = (string) $listing['price'];
             }
@@ -227,10 +227,8 @@ class FetchSyncMirror
     public static function apply($api, $storeId, array $rows)
     {
         $switched = 0;
-        // Sandbox replays an Idempotency-Key, so a later run sending the same rows needs a new one.
-        $run = uniqid('', true);
         foreach (FetchSyncProductSync::batches($rows) as $batch) {
-            $result = $api->batchListings($storeId, $batch, 'ps-mirror-' . md5($run . json_encode($batch)));
+            $result = $api->batchListings($storeId, $batch, FetchSyncProductSync::idempotencyKey('ps-mirror-'));
             if (!FetchSyncApi::ok($result)) {
                 FetchSyncLogger::error(sprintf('Mirror: switching off %d Fetch listing(s) failed: %s', count($batch), FetchSyncApi::errorMessage($result)));
                 break;

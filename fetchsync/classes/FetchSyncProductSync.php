@@ -260,6 +260,17 @@ class FetchSyncProductSync
         return $ok;
     }
 
+    /**
+     * A fresh key for every request. Sandbox replays a key it has seen, so a
+     * key derived from the payload could replay a stale answer for a product
+     * sent again unchanged (and leave a returning product switched off); live
+     * ignores the key.
+     */
+    public static function idempotencyKey($prefix = 'ps-')
+    {
+        return $prefix . bin2hex(random_bytes(16));
+    }
+
     /** Split into requests of at most 200 products and ~450 KB. */
     public static function batches(array $items)
     {
@@ -293,7 +304,7 @@ class FetchSyncProductSync
     {
         $storeId = (string) FetchSyncSettings::get('store_id');
         $api = new FetchSyncApi();
-        $result = $api->upsertProducts($storeId, $items, 'ps-' . md5(json_encode($items)));
+        $result = $api->upsertProducts($storeId, $items, self::idempotencyKey());
 
         if (!FetchSyncApi::ok($result)) {
             $message = FetchSyncApi::errorMessage($result);
