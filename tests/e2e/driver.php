@@ -9,6 +9,8 @@ header('Content-Type: application/json');
 $context = Context::getContext();
 $context->employee = new Employee(1);
 $step = isset($_GET['step']) ? $_GET['step'] : '';
+// The mock Fetch API as the container sees it (the runner passes its port).
+$mockUrl = 'http://host.docker.internal:' . (isset($_GET['mock_port']) ? (int) $_GET['mock_port'] : 9099);
 $out = array('step' => $step);
 $db = Db::getInstance();
 require_once _PS_MODULE_DIR_ . 'fetchsync/fetchsync.php'; // also when the module is not installed yet
@@ -137,7 +139,7 @@ switch ($step) {
         Configuration::updateValue('PS_MAIL_METHOD', 3); // never send mail from the test shop
         FetchSyncSettings::update(array(
             'environment' => 'custom',
-            'custom_base_url' => 'http://host.docker.internal:9099',
+            'custom_base_url' => $mockUrl,
             'client_id' => 'client-1',
             'client_secret' => 'secret-1',
             'sync_products' => 'yes',
@@ -236,7 +238,7 @@ switch ($step) {
         $_POST = array(
             'submitFetchsyncSave' => '1',
             'fetchsync_environment' => 'custom',
-            'fetchsync_custom_base_url' => 'http://host.docker.internal:9099/',
+            'fetchsync_custom_base_url' => $mockUrl . '/',
             'fetchsync_client_id' => 'client-1',
             'fetchsync_client_secret' => '',
             'fetchsync_store_id' => 'store-1',

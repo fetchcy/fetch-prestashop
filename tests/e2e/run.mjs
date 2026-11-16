@@ -14,7 +14,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, '../..');
 const PORT = Number(process.env.PS_PORT || 8088);
 const PS = `http://localhost:${PORT}`;
-const MOCK = 'http://127.0.0.1:9099';
+const MOCK_PORT = Number(process.env.MOCK_PORT || 9099);
+const MOCK = `http://127.0.0.1:${MOCK_PORT}`;
 const REUSE = !!process.env.E2E_REUSE;
 const KEEP = !!process.env.E2E_KEEP || REUSE;
 const results = [];
@@ -52,7 +53,7 @@ if (!process.env.E2E_SOURCE && !REUSE) {
 if (!REUSE) {
   try { fs.unlinkSync(path.join(here, 'mock-requests.json')); } catch {}
 }
-const mock = REUSE ? null : spawn('node', [path.join(here, 'mock-fetch.mjs')], { stdio: 'inherit' });
+const mock = REUSE ? null : spawn('node', [path.join(here, 'mock-fetch.mjs')], { stdio: 'inherit', env: { ...process.env, MOCK_PORT: String(MOCK_PORT) } });
 const cleanup = () => {
   try { mock?.kill(); } catch {}
   if (!KEEP) { try { compose('down', '-v'); } catch {} }
@@ -60,7 +61,7 @@ const cleanup = () => {
 setTimeout(() => { console.log('E2E HARD TIMEOUT'); cleanup(); process.exit(3); }, 20 * 60 * 1000).unref();
 
 async function step(name, params = {}, retry = true) {
-  const qs = new URLSearchParams({ step: name, ...params }).toString();
+  const qs = new URLSearchParams({ step: name, mock_port: String(MOCK_PORT), ...params }).toString();
   let r;
   try {
     r = await fetch(`${PS}/fetchsync-e2e/driver.php?${qs}`, { signal: AbortSignal.timeout(180000) });
@@ -164,7 +165,7 @@ try {
   before = mockLog().requests.filter((r) => r.method === 'PUT' && r.path.endsWith('/products')).length;
   const mk = await step('markup');
   ok('saving markup "10 %" stores 10 and queues the whole catalogue', mk.markup === 10 && mk.queued >= 3 && /price markup changed/i.test(mk.messages.join(' ')), mk);
-  ok('custom URL trailing slash trimmed; token kept when only the markup changed', mk.custom_url === 'http://host.docker.internal:9099' && mk.token_kept === true, mk);
+  ok('custom URL trailing slash trimmed; token kept when only the markup changed', mk.custom_url === `http://host.docker.internal:${MOCK_PORT}` && mk.token_kept === true, mk);
   ok('saving the same markup again queues nothing', mk.queued_on_unchanged_save === 0, mk.queued_on_unchanged_save);
   log = mockLog();
   puts = log.requests.filter((r) => r.method === 'PUT' && r.path.endsWith('/products')).slice(before);
