@@ -5,6 +5,11 @@ It keeps your products, prices and stock in sync with your Fetch store, and brin
 
 It uses the [Fetch Partner API](https://developer.fetch.com.cy) and works the same way as the Fetch for WooCommerce plugin.
 
+> **Beta.**
+> Tested on PrestaShop 8.1 and 1.7.8 against a test copy of the Fetch API, and now being rolled out to the first shops.
+> Talk to Fetch before your first full product sync on a live store, so we can check your existing Fetch products are matched correctly.
+> Report anything that does not work as expected to Fetch merchant support.
+
 ## Features
 
 - **Automatic product sync.** New products, edits, price changes, sales and stock changes are sent to Fetch at the end of the request that made them.
