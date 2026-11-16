@@ -359,6 +359,12 @@ class FetchSyncOrderSync
         if (!$idOrder) {
             throw new PrestaShopException('validateOrder created no order');
         }
+        // PrestaShop switches to "On backorder" when a line is out of stock in the shop;
+        // Fetch has already reserved the item, so keep the Fetch status.
+        $order = new Order($idOrder);
+        if ((int) $order->current_state !== (int) $idState) {
+            self::changeState($order, (int) $idState);
+        }
 
         Db::getInstance()->update(self::TABLE, array(
             'id_order' => $idOrder,

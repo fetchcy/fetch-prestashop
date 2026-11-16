@@ -39,12 +39,8 @@ class FetchSyncInstaller
 
     public static function uninstall()
     {
-        $carrier = self::carrier();
-        if (Validate::isLoadedObject($carrier)) {
-            $carrier->deleted = 1;
-            $carrier->active = 0;
-            $carrier->update();
-        }
+        // Retired the way PrestaShop retires carriers: orders keep pointing at it.
+        Db::getInstance()->update('carrier', array('deleted' => 1, 'active' => 0), '`external_module_name` = \'fetchsync\'');
         $ok = true;
         foreach (self::TABLES as $table) {
             $ok = Db::getInstance()->execute('DROP TABLE IF EXISTS `' . _DB_PREFIX_ . $table . '`') && $ok;
@@ -275,9 +271,9 @@ class FetchSyncInstaller
 
     private static function langField($value)
     {
-        $out = array();
-        foreach (Language::getLanguages(false) as $language) {
-            $out[(int) $language['id_lang']] = $value;
+        $out = array((int) Configuration::get('PS_LANG_DEFAULT') => $value);
+        foreach ((array) Db::getInstance()->executeS('SELECT `id_lang` FROM `' . _DB_PREFIX_ . 'lang`') as $row) {
+            $out[(int) $row['id_lang']] = $value;
         }
 
         return $out;
