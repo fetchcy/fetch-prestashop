@@ -8,7 +8,9 @@
  * allows it), in chunks of 50 products, so a bulk edit or a busy checkout
  * becomes a handful of API calls rather than one per product. Rows that fail
  * stay queued and are retried with back-off by the cron / pseudo-cron.
- * "Sync all products" queues the whole catalogue the same way.
+ * "Sync all products" queues the whole catalogue the same way; in mirror
+ * mode its end also switches off what the shop no longer sells
+ * (FetchSyncMirror).
  */
 if (!defined('_PS_VERSION_')) {
     exit;
@@ -127,6 +129,7 @@ class FetchSyncProductSync
             ON DUPLICATE KEY UPDATE `version` = `version` + 1, `attempts` = 0, `next_try` = 0'
         );
         FetchSyncSettings::setInternal('BULK_RUNNING', '1');
+        FetchSyncSettings::setInternal('BULK_FAILED', '');
         FetchSyncLogger::info(sprintf('%s: %d product(s) queued.', $reason, $count));
         self::scheduleFlush();
 
@@ -205,6 +208,7 @@ class FetchSyncProductSync
             if (FetchSyncSettings::internal('BULK_RUNNING') && 0 === self::pendingCount()) {
                 FetchSyncSettings::setInternal('BULK_RUNNING', '');
                 FetchSyncLogger::info('Full product sync finished.');
+                FetchSyncMirror::afterFullSync();
             }
         } finally {
             FetchSyncCron::unlock('flush');
@@ -294,6 +298,10 @@ class FetchSyncProductSync
         if (!FetchSyncApi::ok($result)) {
             $message = FetchSyncApi::errorMessage($result);
             FetchSyncLogger::error(sprintf('Product sync failed for %d product(s): %s', count($items), $message));
+            if (FetchSyncSettings::internal('BULK_RUNNING')) {
+                // Mirror mode only acts on a full sync whose every request went through.
+                FetchSyncSettings::setInternal('BULK_FAILED', '1');
+            }
             foreach ($items as $item) {
                 if (isset($owners[$item['ref']])) {
                     self::record($owners[$item['ref']], null, 'error', $message, null);

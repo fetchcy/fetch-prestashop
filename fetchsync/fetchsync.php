@@ -17,6 +17,7 @@ require_once __DIR__ . '/classes/FetchSyncApi.php';
 require_once __DIR__ . '/classes/FetchSyncContext.php';
 require_once __DIR__ . '/classes/FetchSyncProductMapper.php';
 require_once __DIR__ . '/classes/FetchSyncProductSync.php';
+require_once __DIR__ . '/classes/FetchSyncMirror.php';
 require_once __DIR__ . '/classes/FetchSyncOrderMapper.php';
 require_once __DIR__ . '/classes/FetchSyncOrderSync.php';
 require_once __DIR__ . '/classes/FetchSyncOrderActions.php';

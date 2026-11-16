@@ -117,6 +117,42 @@ function e2e_states()
     );
 }
 
+/** "Save settings" form fields as they stand, plus $extra (the settings form always posts every field). */
+function e2e_settings_post(array $extra)
+{
+    $s = FetchSyncSettings::all();
+
+    return array_merge(array(
+        'fetchsync_environment' => $s['environment'],
+        'fetchsync_custom_base_url' => $s['custom_base_url'],
+        'fetchsync_client_id' => $s['client_id'],
+        'fetchsync_client_secret' => '',
+        'fetchsync_store_id' => $s['store_id'],
+        'fetchsync_sync_products' => 'yes' === $s['sync_products'] ? '1' : '0',
+        'fetchsync_import_orders' => 'yes' === $s['import_orders'] ? '1' : '0',
+        'fetchsync_auto_accept' => 'yes' === $s['auto_accept'] ? '1' : '0',
+        'fetchsync_prep_minutes' => (string) $s['prep_minutes'],
+        'fetchsync_price_markup' => (string) FetchSyncSettings::markup(),
+        'fetchsync_catalogue_mode' => $s['catalogue_mode'],
+    ), $extra);
+}
+
+/** "Sync all products now", flushed to the end (where mirror mode runs). */
+function e2e_full_sync()
+{
+    $last = (int) Db::getInstance()->getValue('SELECT MAX(id_fetchsync_log) FROM ' . _DB_PREFIX_ . 'fetchsync_log');
+    FetchSyncProductSync::startBulkSync('e2e full sync');
+    for ($i = 0; $i < 20 && FetchSyncSettings::internal('BULK_RUNNING'); ++$i) {
+        FetchSyncProductSync::flush(60);
+    }
+
+    return array(
+        'finished' => !FetchSyncSettings::internal('BULK_RUNNING'),
+        'activity' => array_column(Db::getInstance()->executeS('SELECT message FROM ' . _DB_PREFIX_ . 'fetchsync_log WHERE id_fetchsync_log > ' . $last . ' ORDER BY id_fetchsync_log'), 'message'),
+        'pending' => FetchSyncMirror::pending(),
+    );
+}
+
 switch ($step) {
     case 'ping':
         // Up = PrestaShop finished installing itself (config, languages, order states, catalogue).
@@ -396,6 +432,64 @@ switch ($step) {
         $out['deactivations_queued'] = (int) $db->getValue('SELECT COUNT(*) FROM ' . _DB_PREFIX_ . 'fetchsync_deactivation');
         $out['sent'] = FetchSyncProductSync::flush(30);
         $out['deactivations_after'] = (int) $db->getValue('SELECT COUNT(*) FROM ' . _DB_PREFIX_ . 'fetchsync_deactivation');
+        break;
+
+    case 'mirror_setup':
+        // GIFT-CARD becomes a virtual product (the module does not sync those) and
+        // GONE-1 is deleted while sync is off, so both stay active on Fetch.
+        $tax = e2e_tax_group();
+        $gift = e2e_simple('Gift Card e2e', 'GIFT-CARD', 12.00, 5, $tax);
+        $gone = e2e_simple('Gone Lamp', 'GONE-1', 5.00, 2, $tax);
+        FetchSyncProductSync::flush(30);
+        $out['synced'] = FetchSyncProductMapper::wasSynced((int) $gift->id) && FetchSyncProductMapper::wasSynced((int) $gone->id);
+        $db->update('product', array('is_virtual' => 1), 'id_product = ' . (int) $gift->id);
+        Cache::clean('objectmodel_Product_' . (int) $gift->id . '_*');
+        $out['gift_supported'] = FetchSyncProductMapper::supports(FetchSyncProductMapper::loadProduct((int) $gift->id));
+        FetchSyncSettings::update(array('sync_products' => 'no'));
+        (new Product((int) $gone->id))->delete();
+        FetchSyncSettings::update(array('sync_products' => 'yes'));
+        $out['deactivations'] = (int) $db->getValue('SELECT COUNT(*) FROM ' . _DB_PREFIX_ . 'fetchsync_deactivation');
+        $out['gift_id'] = (int) $gift->id;
+        break;
+
+    case 'mirror_save':
+        // "Save settings" with a catalogue mode.
+        $_POST = e2e_settings_post(array('submitFetchsyncSave' => '1', 'fetchsync_catalogue_mode' => (string) $_GET['mode']));
+        $out['messages'] = array_map('strip_tags', (new FetchSyncAdmin($module))->process());
+        $out['mode'] = FetchSyncSettings::get('catalogue_mode');
+        break;
+
+    case 'mirror_full_sync':
+        $out += e2e_full_sync();
+        $out['notice'] = (new FetchSyncAdmin($module))->mirrorNotice();
+        break;
+
+    case 'mirror_preview':
+        // The "Preview" button (it saves the form first, like every button).
+        $_POST = e2e_settings_post(array('submitFetchsyncMirrorPreview' => '1'));
+        $out['messages'] = array_map(function ($html) {
+            return trim(preg_replace('/\s+/', ' ', strip_tags(str_replace('<li>', ' | ', $html))));
+        }, (new FetchSyncAdmin($module))->process());
+        $out['preview'] = FetchSyncMirror::preview();
+        $out['mode'] = FetchSyncSettings::get('catalogue_mode');
+        break;
+
+    case 'mirror_reactivate':
+        // GIFT-CARD is a normal product again: the normal sync switches it back on.
+        $id = e2e_product_id('GIFT-CARD');
+        $db->update('product', array('is_virtual' => 0), 'id_product = ' . $id);
+        FetchSyncProductSync::queue($id);
+        $out['sent'] = FetchSyncProductSync::flush(30);
+        break;
+
+    case 'mirror_apply':
+        // "Apply anyway" posts only its button.
+        $_POST = array('submitFetchsyncMirrorApply' => '1');
+        $out['messages'] = array_map('strip_tags', (new FetchSyncAdmin($module))->process());
+        $out['pending'] = FetchSyncMirror::pending();
+        $out['notice'] = (new FetchSyncAdmin($module))->mirrorNotice();
+        $out['activity'] = array_column(FetchSyncLogger::activity(5), 'message');
+        $out['settings_kept'] = FetchSyncSettings::isConnected() && FetchSyncSettings::mirrorMode();
         break;
 
     case 'state':

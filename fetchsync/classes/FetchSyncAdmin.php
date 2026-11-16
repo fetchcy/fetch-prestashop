@@ -1,8 +1,8 @@
 <?php
 /**
  * The module's configuration page (Modules → Module Manager → Fetch →
- * Configure): connection, product sync, order import, webhook registration,
- * cron URL and recent activity.
+ * Configure): connection, product sync and catalogue mode, order import,
+ * webhook registration, cron URL and recent activity.
  */
 if (!defined('_PS_VERSION_')) {
     exit;
@@ -31,7 +31,7 @@ class FetchSyncAdmin
 
         $this->process();
 
-        return implode('', $this->messages) . $this->renderIntro() . $this->renderForm() . $this->renderActivity();
+        return implode('', $this->messages) . $this->mirrorNotice() . $this->renderIntro() . $this->renderForm() . $this->renderActivity();
     }
 
     /**
@@ -42,7 +42,15 @@ class FetchSyncAdmin
     public function process()
     {
         $do = null;
-        foreach (array('submitFetchsyncSave' => 'save', 'submitFetchsyncConnect' => 'connect', 'submitFetchsyncBulk' => 'bulk', 'submitFetchsyncWebhook' => 'webhook') as $field => $action) {
+        $actions = array(
+            'submitFetchsyncSave' => 'save',
+            'submitFetchsyncConnect' => 'connect',
+            'submitFetchsyncBulk' => 'bulk',
+            'submitFetchsyncWebhook' => 'webhook',
+            'submitFetchsyncMirrorPreview' => 'mirror_preview',
+            'submitFetchsyncMirrorApply' => 'mirror_apply',
+        );
+        foreach ($actions as $field => $action) {
             if (Tools::isSubmit($field)) {
                 $do = $action;
             }
@@ -56,6 +64,13 @@ class FetchSyncAdmin
 
     private function handle($do)
     {
+        // "Apply anyway" posts from its own small form, without the settings fields.
+        if ('mirror_apply' === $do) {
+            $this->applyMirror();
+
+            return;
+        }
+        $mirrorBefore = FetchSyncSettings::mirrorMode();
         $resync = $this->save();
         switch ($do) {
             case 'connect':
@@ -64,7 +79,8 @@ class FetchSyncAdmin
             case 'bulk':
                 if (FetchSyncSettings::isConnected()) {
                     $count = $resync ? FetchSyncProductSync::pendingCount() : FetchSyncProductSync::startBulkSync();
-                    $this->confirm(sprintf('Full product sync started: %d product(s) queued. They are sent in the background in batches of 50; progress shows under Recent activity.', $count));
+                    $this->confirm(sprintf('Full product sync started: %d product(s) queued. They are sent in the background in batches of 50; progress shows under Recent activity.', $count)
+                        . (FetchSyncSettings::mirrorMode() ? ' When it finishes, mirror mode switches off the Fetch products this shop does not sell.' : ''));
                 } else {
                     $this->error('Connect to Fetch and choose a store first.');
                 }
@@ -72,10 +88,18 @@ class FetchSyncAdmin
             case 'webhook':
                 $this->registerWebhook();
                 break;
+            case 'mirror_preview':
+                $this->previewMirror();
+                break;
             default:
-                $this->confirm($resync
-                    ? 'Settings saved. The price markup changed, so all products are being resent to Fetch.'
-                    : 'Settings saved.');
+                if ($resync) {
+                    $this->confirm('Settings saved. The price markup changed, so all products are being resent to Fetch.'
+                        . (FetchSyncSettings::mirrorMode() ? ' Mirror mode runs when that full sync finishes.' : ''));
+                } elseif (!$mirrorBefore && FetchSyncSettings::mirrorMode()) {
+                    $this->confirm('Settings saved. Mirror mode runs at the end of the next full sync: press "Sync all products now". Press "Preview" first to see what it would switch off.');
+                } else {
+                    $this->confirm('Settings saved.');
+                }
         }
     }
 
@@ -106,7 +130,11 @@ class FetchSyncAdmin
             'auto_accept' => '1' === $get('auto_accept') ? 'yes' : 'no',
             'prep_minutes' => max(0, min(180, (int) $get('prep_minutes'))),
             'price_markup' => (string) FetchSyncSettings::sanitizeMarkup($rawMarkup),
+            'catalogue_mode' => FetchSyncSettings::sanitizeCatalogueMode($get('catalogue_mode')),
         );
+        if (FetchSyncSettings::MODE_MIRROR !== $new['catalogue_mode']) {
+            FetchSyncSettings::setInternal('MIRROR_PENDING', '');
+        }
 
         $secret = trim((string) Tools::getValue('fetchsync_client_secret', ''));
         if ('' !== $secret) {
@@ -190,6 +218,104 @@ class FetchSyncAdmin
         $this->confirm(1 === count($stores)
             ? 'Connected. 1 store found.'
             : sprintf('Connected. %d stores found — pick one and save.', count($stores)));
+    }
+
+    private function previewMirror()
+    {
+        if (!FetchSyncSettings::isConnected()) {
+            $this->error('Connect to Fetch and choose a store first.');
+
+            return;
+        }
+        $preview = FetchSyncMirror::preview();
+        if ('failed' === $preview['status']) {
+            $this->error('Preview failed: could not read your Fetch listings (' . $preview['error'] . ').');
+
+            return;
+        }
+        $h = function ($text) {
+            return htmlspecialchars((string) $text, ENT_QUOTES, 'UTF-8');
+        };
+        $html = '<div class="alert alert-info fetchsync-mirror-preview"><p><strong>' . $h('Mirror preview') . ':</strong> '
+            . $h(sprintf('%d of %d Fetch products would be switched off.', $preview['off'], $preview['active'])) . '</p>';
+        if ($preview['samples']) {
+            $html .= '<ul>';
+            foreach ($preview['samples'] as $name) {
+                $html .= '<li>' . $h($name) . '</li>';
+            }
+            $html .= '</ul>';
+            if ($preview['off'] > count($preview['samples'])) {
+                $html .= '<p>' . $h(sprintf('… and %d more.', $preview['off'] - count($preview['samples']))) . '</p>';
+            }
+        }
+        $notes = array(sprintf('%d Fetch product(s) match this shop and stay on sale. Nothing has been changed.', $preview['kept']));
+        if ($preview['held']) {
+            $notes[] = 'That is more than half of your active Fetch products, so a mirror run will wait for you to press "Apply anyway".';
+        }
+        if (!FetchSyncSettings::mirrorMode()) {
+            $notes[] = 'Choose "Mirror this shop 1:1" and run a full sync to apply it.';
+        }
+        $html .= '<p>' . $h(implode(' ', $notes)) . '</p></div>';
+        $this->messages[] = $html;
+    }
+
+    private function applyMirror()
+    {
+        if (!FetchSyncSettings::isConnected() || !FetchSyncSettings::mirrorMode()) {
+            $this->error('Mirror mode is not on.');
+
+            return;
+        }
+        if (!FetchSyncMirror::pending()) {
+            $this->warning('No mirror run is waiting to be applied.');
+
+            return;
+        }
+        if (!FetchSyncCron::lock('flush')) {
+            $this->warning('A product sync is running. Try again in a minute.');
+
+            return;
+        }
+        try {
+            $result = FetchSyncMirror::run(true);
+        } finally {
+            FetchSyncCron::unlock('flush');
+        }
+        if ('failed' === $result['status']) {
+            $this->error('Mirror not applied: could not read your Fetch listings (' . $result['error'] . '). Nothing was switched off.');
+
+            return;
+        }
+        $message = sprintf('Mirror applied: %d Fetch product(s) switched off, %d kept.', $result['switched_off'], $result['kept']);
+        if ($result['errors']) {
+            $this->warning($message . sprintf(' %d could not be switched off; see Recent activity.', $result['errors']));
+        } else {
+            $this->confirm($message);
+        }
+    }
+
+    /** Admin notice for a mirror run the over-half guard is holding. */
+    public function mirrorNotice()
+    {
+        $pending = FetchSyncMirror::pending();
+        if (!$pending || !FetchSyncSettings::mirrorMode()) {
+            return '';
+        }
+        $h = function ($text) {
+            return htmlspecialchars((string) $text, ENT_QUOTES, 'UTF-8');
+        };
+        $action = AdminController::$currentIndex . '&configure=' . $this->module->name . '&token=' . Tools::getAdminTokenLite('AdminModules');
+        $text = sprintf(
+            'Mirror mode is waiting for you. On %s it would have switched off %d of the %d active products in your Fetch store, more than half, so nothing was switched off. Press "Preview" under Products to see which ones. If that is right, apply it once.',
+            date('Y-m-d H:i', (int) $pending['at']),
+            (int) $pending['off'],
+            (int) $pending['active']
+        );
+
+        return '<div class="alert alert-warning fetchsync-mirror-pending"><p>' . $h($text) . '</p>'
+            . '<form method="post" action="' . $h($action) . '" style="margin-top:8px">'
+            . '<button type="submit" name="submitFetchsyncMirrorApply" value="1" class="btn btn-warning" onclick="return confirm(' . $h(json_encode('Switch these products off on Fetch? They are not deleted, and come back when this shop sells them again.')) . ');">'
+            . $h('Apply anyway') . '</button></form></div>';
     }
 
     private function registerWebhook()
@@ -332,9 +458,28 @@ class FetchSyncAdmin
                     'suffix' => '%',
                     'desc' => 'Added to every price and sale price sent to Fetch, e.g. 10 sends a €10.00 product as €11.00. Your PrestaShop prices are not changed.',
                 ),
+                array(
+                    'type' => 'select',
+                    'label' => 'Catalogue mode',
+                    'name' => 'fetchsync_catalogue_mode',
+                    'desc' => '"Add and update only" never touches the other products in your Fetch store. '
+                        . '"Mirror this shop 1:1": Products in your Fetch store that aren\'t in this shop will be switched off on Fetch (not deleted). Prices and stock always follow this shop. '
+                        . 'It runs at the end of every full sync ("Sync all products now", or a price markup change). '
+                        . 'Product names, photos and descriptions come from Fetch\'s shared catalogue, which other stores use too, so they are not overwritten. '
+                        . 'Press "Preview" to see what it would switch off.',
+                    'options' => array(
+                        'query' => array(
+                            array('id' => FetchSyncSettings::MODE_ADD, 'name' => 'Add and update only'),
+                            array('id' => FetchSyncSettings::MODE_MIRROR, 'name' => 'Mirror this shop 1:1'),
+                        ),
+                        'id' => 'id',
+                        'name' => 'name',
+                    ),
+                ),
             ),
             'buttons' => $connected ? array(
                 array('title' => 'Sync all products now', 'name' => 'submitFetchsyncBulk', 'type' => 'submit', 'icon' => 'process-icon-upload', 'class' => 'pull-right'),
+                array('title' => 'Preview', 'name' => 'submitFetchsyncMirrorPreview', 'type' => 'submit', 'icon' => 'process-icon-preview', 'class' => 'pull-right'),
             ) : array(),
         ));
         $forms[] = array('form' => array(
@@ -370,6 +515,7 @@ class FetchSyncAdmin
                 'fetchsync_store_id' => $s['store_id'],
                 'fetchsync_sync_products' => 'yes' === $s['sync_products'] ? 1 : 0,
                 'fetchsync_price_markup' => (string) FetchSyncSettings::markup(),
+                'fetchsync_catalogue_mode' => FetchSyncSettings::sanitizeCatalogueMode($s['catalogue_mode']),
                 'fetchsync_import_orders' => 'yes' === $s['import_orders'] ? 1 : 0,
                 'fetchsync_auto_accept' => 'yes' === $s['auto_accept'] ? 1 : 0,
                 'fetchsync_prep_minutes' => (int) $s['prep_minutes'],
