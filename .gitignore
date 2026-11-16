@@ -1,0 +1,4 @@
+dist/
+tests/e2e/mock-requests.json
+tests/e2e/.state/
+.DS_Store
