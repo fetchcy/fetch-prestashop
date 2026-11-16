@@ -2,10 +2,63 @@
 /**
  * Standalone unit tests (no PrestaShop): `php tests/unit.php`.
  * Covers webhook signature verification, the order mapping rules, the price
- * markup maths, the server setting and request batching. The webhook, status
- * and markup cases are the same as the WooCommerce plugin's.
+ * markup maths, the server setting, request batching and the mirror mode's
+ * scan / plan / guard / switch-off logic against a fake Partner API. The
+ * webhook, status, markup and mirror cases are the same as the WooCommerce
+ * plugin's.
  */
 define('_PS_VERSION_', '8.1.0');
+define('_DB_PREFIX_', 'ps_');
+
+function pSQL($string, $htmlOk = false)
+{
+    return addslashes((string) $string);
+}
+
+/** Just enough of PrestaShop's Db, Tools and logger for FetchSyncLogger; messages land in Db::$logged. */
+class Db
+{
+    public static $logged = array();
+    private static $instance;
+
+    public static function getInstance()
+    {
+        return self::$instance ? self::$instance : (self::$instance = new self());
+    }
+
+    public function insert($table, array $data)
+    {
+        self::$logged[] = $data['level'] . ': ' . stripslashes($data['message']);
+
+        return true;
+    }
+
+    public function Insert_ID()
+    {
+        return count(self::$logged);
+    }
+
+    public function delete($table, $where)
+    {
+        return true;
+    }
+}
+
+class Tools
+{
+    public static function substr($string, $start, $length = null)
+    {
+        return null === $length ? substr($string, $start) : substr($string, $start, $length);
+    }
+}
+
+class PrestaShopLogger
+{
+    public static function addLog()
+    {
+        return true;
+    }
+}
 
 /** Just enough of PrestaShop's Configuration for FetchSyncSettings. */
 class Configuration
@@ -43,6 +96,9 @@ require $dir . 'FetchSyncOrderMapper.php';
 require $dir . 'FetchSyncWebhook.php';
 require $dir . 'FetchSyncProductMapper.php';
 require $dir . 'FetchSyncProductSync.php';
+require $dir . 'FetchSyncLogger.php';
+require $dir . 'FetchSyncApi.php';
+require $dir . 'FetchSyncMirror.php';
 
 $failures = 0;
 $passes = 0;
@@ -259,6 +315,248 @@ $sizes = array_map(function ($batch) {
 }, FetchSyncProductSync::batches($big));
 check('large items split under 500 KB per request', max($sizes) < 500 * 1024 && count($sizes) > 1, true);
 check('no items → no batches', FetchSyncProductSync::batches(array()), array());
+
+// --- Mirror mode -------------------------------------------------------------------------
+
+/** Partner API double: pages GET /listings with a numeric cursor, records listings/batch. */
+class FakeFetchApi
+{
+    public $listings = array();
+    public $pageSize = 2;
+    public $failPage = null;
+    public $rejectIds = array();
+    public $failBatches = false;
+    public $pages = array();
+    public $batches = array();
+
+    public function __construct(array $listings = array())
+    {
+        $this->listings = $listings;
+    }
+
+    public function listListings($storeId, array $query = array())
+    {
+        $this->pages[] = $query;
+        if (count($this->pages) === $this->failPage) {
+            return array('code' => 503, 'body' => array('statusCode' => 503, 'message' => 'forced 503'), 'error' => null, 'retry_after' => null);
+        }
+        $offset = isset($query['cursor']) ? (int) $query['cursor'] : 0;
+        $next = $offset + $this->pageSize < count($this->listings) ? (string) ($offset + $this->pageSize) : null;
+
+        return array('code' => 200, 'body' => array('data' => array_slice($this->listings, $offset, $this->pageSize), 'nextCursor' => $next), 'error' => null, 'retry_after' => null);
+    }
+
+    public function batchListings($storeId, array $items, $idempotencyKey)
+    {
+        $this->batches[] = array('store' => $storeId, 'items' => $items, 'key' => $idempotencyKey, 'bytes' => strlen(json_encode(array('items' => $items))));
+        if ($this->failBatches) {
+            return array('code' => 0, 'body' => null, 'error' => 'Could not reach Fetch: timeout', 'retry_after' => null);
+        }
+        $results = array();
+        $rejected = 0;
+        foreach ($items as $item) {
+            $id = isset($item['listingId']) ? $item['listingId'] : null;
+            if (in_array($id, $this->rejectIds, true)) {
+                ++$rejected;
+                $results[] = array('ref' => null, 'listingId' => $id, 'status' => 'error', 'code' => 'not_permitted', 'message' => 'Listing is locked');
+                continue;
+            }
+            $results[] = array('ref' => null, 'listingId' => $id, 'status' => 'updated');
+        }
+
+        return array('code' => 201, 'body' => array('accepted' => count($items) - $rejected, 'rejected' => $rejected, 'results' => $results), 'error' => null, 'retry_after' => null);
+    }
+
+    public function switchedOff()
+    {
+        $out = array();
+        foreach ($this->batches as $batch) {
+            foreach ($batch['items'] as $item) {
+                $out[] = $item['listingId'];
+            }
+        }
+
+        return $out;
+    }
+}
+
+function listing($id, $ref, $active = true, $price = '10.00', $name = null)
+{
+    return array('listingId' => $id, 'productId' => 'p-' . $id, 'variantId' => null, 'name' => null !== $name ? $name : 'Item ' . $id, 'ref' => $ref, 'price' => $price, 'salePrice' => null, 'stockCount' => 3, 'isActive' => $active);
+}
+
+function mirrorReset($mode)
+{
+    Configuration::$values = array();
+    Db::$logged = array();
+    FetchSyncSettings::update(array('client_id' => 'c', 'client_secret' => 's', 'store_id' => 'store-1', 'catalogue_mode' => $mode));
+}
+
+function logged($pattern)
+{
+    return count(preg_grep($pattern, Db::$logged));
+}
+
+// The shop sells A-1, A-2, A-3 (and A-4, inactive on Fetch). GIFT is a product the
+// module does not sync (filtered out), OLD-9 is gone from the shop, lst-c has no ref.
+$keep = array('A-1' => true, 'A-2' => true, 'A-3' => true, 'A-4' => true);
+$store = array(
+    listing('lst-1', 'A-1'),
+    listing('lst-2', 'A-2'),
+    listing('lst-3', 'A-3'),
+    listing('lst-4', 'A-4', false),
+    listing('lst-c', null, true, '4.50', 'Portal-only item'),
+    listing('lst-g', 'GIFT', true, '25.00', 'Gift card'),
+    listing('lst-o', 'OLD-9', true, '7.99', 'Old product'),
+    listing('lst-x', 'OLD-X', false, '1.00', 'Already off'),
+    listing('lst-2', 'A-2'), // seen again on a later page: counted once
+);
+
+check('default catalogue mode: add and update only', FetchSyncSettings::get('catalogue_mode'), 'add_update');
+check('sanitize catalogue mode mirror', FetchSyncSettings::sanitizeCatalogueMode('mirror'), 'mirror');
+check('sanitize catalogue mode garbage', FetchSyncSettings::sanitizeCatalogueMode('delete_all'), 'add_update');
+check('mirror internals removed on uninstall', array_values(array_intersect(array('BULK_FAILED', 'MIRROR_PENDING'), FetchSyncSettings::INTERNAL_KEYS)), array('BULK_FAILED', 'MIRROR_PENDING'));
+
+mirrorReset('add_update');
+$api = new FakeFetchApi($store);
+check('mirror off: end of full sync does nothing', FetchSyncMirror::afterFullSync($api, $keep), null);
+check('mirror off: no listing read, nothing switched off', array(count($api->pages), count($api->batches)), array(0, 0));
+
+mirrorReset('mirror');
+FetchSyncSettings::setInternal('BULK_FAILED', '1');
+$api = new FakeFetchApi($store);
+check('full sync with a failed request: mirror skipped', FetchSyncMirror::afterFullSync($api, $keep), null);
+check('full sync with a failed request: nothing read or switched off', array(count($api->pages), count($api->batches)), array(0, 0));
+check('full sync with a failed request: skip logged', logged('/^error: Mirror skipped: Fetch could not be reached/'), 1);
+check('failure flag cleared for the next full sync', FetchSyncSettings::internal('BULK_FAILED'), '');
+
+mirrorReset('mirror');
+$api = new FakeFetchApi($store);
+$run = FetchSyncMirror::afterFullSync($api, $keep);
+check('mirror on: run done', $run['status'], 'done');
+check('mirror on: scan pages with limit 500 and follows nextCursor', array_map(function ($q) {
+    return isset($q['cursor']) ? $q['limit'] . '@' . $q['cursor'] : $q['limit'] . '@';
+}, $api->pages), array('500@', '500@2', '500@4', '500@6', '500@8'));
+check('mirror on: counts (scanned once per listing, active, kept)', array($run['scanned'], $run['active'], $run['kept'], $run['off']), array(8, 6, 4, 3));
+check('mirror on: switches off the no-ref, filtered-out and gone listings only', $api->switchedOff(), array('lst-c', 'lst-g', 'lst-o'));
+check('mirror on: rows by the scanned listingId (never ref), with the current price and isActive false', $api->batches[0]['items'], array(
+    array('listingId' => 'lst-c', 'price' => '4.50', 'isActive' => false),
+    array('listingId' => 'lst-g', 'price' => '25.00', 'isActive' => false),
+    array('listingId' => 'lst-o', 'price' => '7.99', 'isActive' => false),
+));
+check('mirror on: one row identifier each (live refuses ambiguous rows)', count(array_filter($api->batches[0]['items'], function ($row) {
+    return 1 !== count(array_intersect_key($row, array('ref' => 1, 'listingId' => 1, 'barcode' => 1)));
+})), 0);
+check('mirror on: batch sent to the configured store with an idempotency key', $api->batches[0]['store'] === 'store-1' && 0 === strpos($api->batches[0]['key'], 'ps-mirror-'), true);
+check('mirror on: result', array($run['switched_off'], $run['errors']), array(3, 0));
+check('mirror on: run logged with scanned, kept, switched off, errors', logged('/^info: Mirror: scanned 8 Fetch listing\(s\), kept 4, switched off 3, 0 error\(s\)\.$/'), 1);
+check('a listing the shop sells that is off on Fetch is left alone (the normal sync switches it back on)', in_array('lst-4', $api->switchedOff(), true), false);
+
+$again = new FakeFetchApi($store);
+FetchSyncMirror::run(false, $again, $keep);
+check('a later run with the same rows uses a new idempotency key (sandbox replays keys)', $again->batches[0]['key'] !== $api->batches[0]['key'], true);
+check('product push: a fresh idempotency key per request, not a hash of the payload', preg_match('/^ps-[0-9a-f]{32}$/', FetchSyncProductSync::idempotencyKey()) && FetchSyncProductSync::idempotencyKey() !== FetchSyncProductSync::idempotencyKey(), true);
+check('mirror: keys carry their own prefix', 0 === strpos(FetchSyncProductSync::idempotencyKey('ps-mirror-'), 'ps-mirror-'), true);
+
+mirrorReset('mirror');
+$api = new FakeFetchApi($store);
+$api->failPage = 2;
+$run = FetchSyncMirror::afterFullSync($api, $keep);
+check('scan page failing: run failed', $run['status'], 'failed');
+check('scan page failing: nothing switched off', count($api->batches), 0);
+check('scan page failing: logged', logged('/^error: Mirror skipped: could not read your Fetch listings \(HTTP 503: forced 503\)\. Nothing was switched off\.$/'), 1);
+$api = new FakeFetchApi($store);
+$api->failPage = 5;
+check('last scan page failing: nothing switched off either', array(FetchSyncMirror::run(false, $api, $keep)['status'], count($api->batches)), array('failed', 0));
+
+// Guard: more than half of the active listings would go.
+check('guard: 3 of 4 is more than half', FetchSyncMirror::tooMany(3, 4), true);
+check('guard: exactly half applies', FetchSyncMirror::tooMany(2, 4), false);
+check('guard: nothing to switch off', FetchSyncMirror::tooMany(0, 0), false);
+check('guard: the only active listing', FetchSyncMirror::tooMany(1, 1), true);
+mirrorReset('mirror');
+$few = array('A-1' => true);
+$api = new FakeFetchApi($store);
+$run = FetchSyncMirror::afterFullSync($api, $few);
+check('guard: run held', array($run['status'], $run['off'], $run['active']), array('held', 5, 6));
+check('guard: nothing switched off', count($api->batches), 0);
+check('guard: pending run stored for the admin notice', array_intersect_key((array) FetchSyncMirror::pending(), array('off' => 1, 'active' => 1)), array('off' => 5, 'active' => 6));
+check('guard: held run logged', logged('/^error: Mirror held: it would switch off 5 of 6 active Fetch products, more than half\. Nothing was switched off\./'), 1);
+$api = new FakeFetchApi($store);
+$run = FetchSyncMirror::run(true, $api, $few);
+check('Apply anyway: applied despite the guard', array($run['status'], $run['switched_off']), array('done', 5));
+check('Apply anyway: switches off everything the shop does not sell', $api->switchedOff(), array('lst-2', 'lst-3', 'lst-c', 'lst-g', 'lst-o'));
+check('Apply anyway: pending run cleared', FetchSyncMirror::pending(), null);
+
+// Preview: counts and up to 20 names, changes nothing.
+mirrorReset('add_update');
+$many = array();
+for ($i = 0; $i < 30; ++$i) {
+    $many[] = listing('lst-f' . $i, 'F-' . $i, true, '2.00', 'Foreign ' . $i);
+}
+for ($i = 0; $i < 40; ++$i) {
+    $many[] = listing('lst-k' . $i, 'K-' . $i);
+}
+$keepMany = array();
+for ($i = 0; $i < 40; ++$i) {
+    $keepMany['K-' . $i] = true;
+}
+$api = new FakeFetchApi($many);
+$api->pageSize = 500;
+$preview = FetchSyncMirror::preview($api, $keepMany);
+check('preview: N of M', array($preview['status'], $preview['off'], $preview['active'], $preview['kept']), array('preview', 30, 70, 40));
+check('preview: at most 20 sample names', $preview['samples'], array_map(function ($i) {
+    return 'Foreign ' . $i;
+}, range(0, 19)));
+check('preview: under half, would not be held', $preview['held'], false);
+check('preview: works before mirror mode is on and switches nothing off', count($api->batches), 0);
+$api = new FakeFetchApi($many);
+check('preview: flags a run the guard would hold', FetchSyncMirror::preview($api, array('K-0' => true))['held'], true);
+$api = new FakeFetchApi($many);
+$api->failPage = 1;
+check('preview: a failed scan is reported', FetchSyncMirror::preview($api, $keepMany), array('status' => 'failed', 'error' => 'HTTP 503: forced 503'));
+check('preview: no-name listing shown by id', FetchSyncMirror::preview(new FakeFetchApi(array(listing('lst-n', null, true, '1.00', ''))), array())['samples'], array('lst-n'));
+
+// Batching above 200 rows.
+mirrorReset('mirror');
+$big = array();
+for ($i = 0; $i < 450; ++$i) {
+    $big[] = listing('lst-b' . $i, 'B-' . $i, true, '3.00', str_repeat('Long name ', 20));
+    $big[] = listing('lst-s' . $i, 'S-' . $i);
+}
+$keepBig = array();
+for ($i = 0; $i < 450; ++$i) {
+    $keepBig['S-' . $i] = true;
+}
+$api = new FakeFetchApi($big);
+$api->pageSize = 500;
+$run = FetchSyncMirror::afterFullSync($api, $keepBig);
+check('batching: 450 rows → requests of 200, 200, 50', array_map(function ($b) {
+    return count($b['items']);
+}, $api->batches), array(200, 200, 50));
+check('batching: every request under 450 KB', max(array_column($api->batches, 'bytes')) < 450000, true);
+check('batching: two scan pages of at most 500', count($api->pages), 2);
+check('batching: all 450 switched off, none of the shop\'s', array($run['switched_off'], $run['errors'], count(preg_grep('/^lst-s/', $api->switchedOff()))), array(450, 0, 0));
+$rows = array();
+for ($i = 0; $i < 150; ++$i) {
+    $rows[] = array('ref' => 'R-' . $i, 'price' => '1.00', 'isActive' => false, 'pad' => str_repeat('x', 4000));
+}
+check('batching: large rows split by size too', array_map('count', FetchSyncProductSync::batches($rows)), array(110, 40));
+
+// Errors.
+mirrorReset('mirror');
+$api = new FakeFetchApi($store);
+$api->rejectIds = array('lst-o');
+$run = FetchSyncMirror::run(false, $api, $keep);
+check('a refused row is an error, the rest are switched off', array($run['switched_off'], $run['errors']), array(2, 1));
+check('a refused row is logged with Fetch\'s reason', logged('/^error: Mirror: Fetch refused to switch off lst-o: not_permitted: Listing is locked$/'), 1);
+check('a run with errors is logged as an error', logged('/^error: Mirror: scanned 8 Fetch listing\(s\), kept 4, switched off 2, 1 error\(s\)\.$/'), 1);
+$api = new FakeFetchApi($big);
+$api->pageSize = 500;
+$api->failBatches = true;
+$run = FetchSyncMirror::run(false, $api, $keepBig);
+check('a failed batch request stops the run; nothing counted as switched off', array(count($api->batches), $run['switched_off'], $run['errors']), array(1, 0, 450));
+Configuration::$values = array();
 
 echo "$passes passed, $failures failed\n";
 exit($failures ? 1 : 0);

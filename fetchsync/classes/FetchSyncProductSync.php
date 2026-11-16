@@ -8,7 +8,9 @@
  * allows it), in chunks of 50 products, so a bulk edit or a busy checkout
  * becomes a handful of API calls rather than one per product. Rows that fail
  * stay queued and are retried with back-off by the cron / pseudo-cron.
- * "Sync all products" queues the whole catalogue the same way.
+ * "Sync all products" queues the whole catalogue the same way; in mirror
+ * mode its end also switches off what the shop no longer sells
+ * (FetchSyncMirror).
  */
 if (!defined('_PS_VERSION_')) {
     exit;
@@ -127,6 +129,7 @@ class FetchSyncProductSync
             ON DUPLICATE KEY UPDATE `version` = `version` + 1, `attempts` = 0, `next_try` = 0'
         );
         FetchSyncSettings::setInternal('BULK_RUNNING', '1');
+        FetchSyncSettings::setInternal('BULK_FAILED', '');
         FetchSyncLogger::info(sprintf('%s: %d product(s) queued.', $reason, $count));
         self::scheduleFlush();
 
@@ -205,6 +208,7 @@ class FetchSyncProductSync
             if (FetchSyncSettings::internal('BULK_RUNNING') && 0 === self::pendingCount()) {
                 FetchSyncSettings::setInternal('BULK_RUNNING', '');
                 FetchSyncLogger::info('Full product sync finished.');
+                FetchSyncMirror::afterFullSync();
             }
         } finally {
             FetchSyncCron::unlock('flush');
@@ -256,6 +260,17 @@ class FetchSyncProductSync
         return $ok;
     }
 
+    /**
+     * A fresh key for every request. Sandbox replays a key it has seen, so a
+     * key derived from the payload could replay a stale answer for a product
+     * sent again unchanged (and leave a returning product switched off); live
+     * ignores the key.
+     */
+    public static function idempotencyKey($prefix = 'ps-')
+    {
+        return $prefix . bin2hex(random_bytes(16));
+    }
+
     /** Split into requests of at most 200 products and ~450 KB. */
     public static function batches(array $items)
     {
@@ -289,11 +304,15 @@ class FetchSyncProductSync
     {
         $storeId = (string) FetchSyncSettings::get('store_id');
         $api = new FetchSyncApi();
-        $result = $api->upsertProducts($storeId, $items, 'ps-' . md5(json_encode($items)));
+        $result = $api->upsertProducts($storeId, $items, self::idempotencyKey());
 
         if (!FetchSyncApi::ok($result)) {
             $message = FetchSyncApi::errorMessage($result);
             FetchSyncLogger::error(sprintf('Product sync failed for %d product(s): %s', count($items), $message));
+            if (FetchSyncSettings::internal('BULK_RUNNING')) {
+                // Mirror mode only acts on a full sync whose every request went through.
+                FetchSyncSettings::setInternal('BULK_FAILED', '1');
+            }
             foreach ($items as $item) {
                 if (isset($owners[$item['ref']])) {
                     self::record($owners[$item['ref']], null, 'error', $message, null);

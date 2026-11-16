@@ -14,7 +14,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, '../..');
 const PORT = Number(process.env.PS_PORT || 8088);
 const PS = `http://localhost:${PORT}`;
-const MOCK = 'http://127.0.0.1:9099';
+const MOCK_PORT = Number(process.env.MOCK_PORT || 9099);
+const MOCK = `http://127.0.0.1:${MOCK_PORT}`;
 const REUSE = !!process.env.E2E_REUSE;
 const KEEP = !!process.env.E2E_KEEP || REUSE;
 const results = [];
@@ -52,7 +53,7 @@ if (!process.env.E2E_SOURCE && !REUSE) {
 if (!REUSE) {
   try { fs.unlinkSync(path.join(here, 'mock-requests.json')); } catch {}
 }
-const mock = REUSE ? null : spawn('node', [path.join(here, 'mock-fetch.mjs')], { stdio: 'inherit' });
+const mock = REUSE ? null : spawn('node', [path.join(here, 'mock-fetch.mjs')], { stdio: 'inherit', env: { ...process.env, MOCK_PORT: String(MOCK_PORT) } });
 const cleanup = () => {
   try { mock?.kill(); } catch {}
   if (!KEEP) { try { compose('down', '-v'); } catch {} }
@@ -60,7 +61,7 @@ const cleanup = () => {
 setTimeout(() => { console.log('E2E HARD TIMEOUT'); cleanup(); process.exit(3); }, 20 * 60 * 1000).unref();
 
 async function step(name, params = {}, retry = true) {
-  const qs = new URLSearchParams({ step: name, ...params }).toString();
+  const qs = new URLSearchParams({ step: name, mock_port: String(MOCK_PORT), ...params }).toString();
   let r;
   try {
     r = await fetch(`${PS}/fetchsync-e2e/driver.php?${qs}`, { signal: AbortSignal.timeout(180000) });
@@ -127,7 +128,7 @@ try {
   cronToken = new URL(cfg.cron_url).searchParams.get('token');
   let log = mockLog();
   ok('token request is client_credentials', log.requests.some((r) => r.path === '/api/v1/oauth/token' && r.body?.grant_type === 'client_credentials' && r.body?.client_id === 'client-1'));
-  ok('User-Agent identifies the module', log.requests.some((r) => /^FetchForPrestaShop\/1\.0\.0/.test(r.ua || '')), log.requests.at(-1)?.ua);
+  ok('User-Agent identifies the module', log.requests.some((r) => /^FetchForPrestaShop\/1\.1\.0/.test(r.ua || '')), log.requests.at(-1)?.ua);
 
   // --- Products ---------------------------------------------------------------
   const prod = await step('create_products');
@@ -164,7 +165,7 @@ try {
   before = mockLog().requests.filter((r) => r.method === 'PUT' && r.path.endsWith('/products')).length;
   const mk = await step('markup');
   ok('saving markup "10 %" stores 10 and queues the whole catalogue', mk.markup === 10 && mk.queued >= 3 && /price markup changed/i.test(mk.messages.join(' ')), mk);
-  ok('custom URL trailing slash trimmed; token kept when only the markup changed', mk.custom_url === 'http://host.docker.internal:9099' && mk.token_kept === true, mk);
+  ok('custom URL trailing slash trimmed; token kept when only the markup changed', mk.custom_url === `http://host.docker.internal:${MOCK_PORT}` && mk.token_kept === true, mk);
   ok('saving the same markup again queues nothing', mk.queued_on_unchanged_save === 0, mk.queued_on_unchanged_save);
   log = mockLog();
   puts = log.requests.filter((r) => r.method === 'PUT' && r.path.endsWith('/products')).slice(before);
@@ -301,6 +302,91 @@ try {
   const lamp = log.requests.filter((x) => x.method === 'PUT' && x.path.endsWith('/products')).flatMap((x) => x.body.products).filter((p) => p.ref === 'LAMP-TMP');
   ok('deleting a synced product switches it off on Fetch (full row, price included)', del.synced === true && del.deactivations_queued === 1 && del.deactivations_after === 0 && lamp.at(-1)?.isActive === false && lamp.at(-1)?.price === '22.00', { del, lamp: lamp.at(-1) });
   ok('all PUT payloads still pass mock validation', log.problems.length === 0, log.problems);
+
+  // --- Mirror this shop 1:1 -------------------------------------------------------------------
+  const mockListings = async () => (await (await fetch(`${MOCK}/__listings`)).json()).data;
+  const listingByRef = (all, ref) => all.find((l) => l.ref === ref);
+  const batchesSince = (n) => mockLog().requests.slice(n).filter((r) => r.method === 'POST' && r.path.endsWith('/listings/batch'));
+  const scansSince = (n) => mockLog().requests.slice(n).filter((r) => r.method === 'GET' && r.path.endsWith('/listings'));
+  const mark = () => mockLog().requests.length;
+
+  const ms = await step('mirror_setup');
+  ok('mirror setup: gift card synced then made virtual (not synced), lamp deleted while sync was off', ms.synced === true && ms.gift_supported === false && ms.deactivations === 0, ms);
+  await fetch(`${MOCK}/__seed-listings`, { method: 'POST', body: JSON.stringify({ listings: [
+    { ref: 'OLD-1', name: 'Discontinued kettle', price: '30.00', isActive: true },
+    { ref: null, name: 'Portal-only bundle', price: '15.00', isActive: true },
+    { ref: 'OLD-2', name: 'Already switched off', price: '3.00', isActive: false },
+  ] }) });
+  const foreign = ['OLD-1', 'GIFT-CARD', 'GONE-1'];
+  let L = await mockListings();
+  const noRef = L.find((l) => l.name === 'Portal-only bundle');
+  ok('mirror setup: foreign, no-ref, filtered-out and deleted listings are active on Fetch', foreign.every((r) => listingByRef(L, r)?.isActive === true) && noRef?.isActive === true, L.filter((l) => foreign.includes(l.ref) || !l.ref));
+
+  let m0 = mark();
+  let fs1 = await step('mirror_full_sync');
+  L = await mockListings();
+  ok('mirror off: a full sync switches nothing off', fs1.finished && batchesSince(m0).length === 0 && scansSince(m0).length === 0 && foreign.every((r) => listingByRef(L, r)?.isActive === true) && noRef && L.find((l) => l.listingId === noRef.listingId).isActive === true && !fs1.activity.some((a) => /^Mirror/.test(a)), { activity: fs1.activity, batches: batchesSince(m0).length });
+
+  const activeNow = L.filter((l) => l.isActive).length;
+  m0 = mark();
+  const pv = await step('mirror_preview');
+  ok('preview: "4 of M Fetch products would be switched off" with their names, before mirror mode is on', pv.mode === 'add_update' && pv.preview.off === 4 && pv.preview.active === activeNow && pv.messages.some((x) => x.includes(`4 of ${activeNow} Fetch products would be switched off`) && ['Discontinued kettle', 'Portal-only bundle', 'Gift Card e2e', 'Gone Lamp'].every((n) => x.includes(n))), { pv, activeNow });
+  ok('preview changes nothing', batchesSince(m0).length === 0 && scansSince(m0).every((r) => r.query.limit === '500'), batchesSince(m0).length);
+
+  const sv = await step('mirror_save', { mode: 'mirror' });
+  ok('saving "Mirror this shop 1:1" stores the mode and says when it runs', sv.mode === 'mirror' && sv.messages.some((x) => /Mirror mode runs at the end of the next full sync/.test(x)), sv);
+
+  await fetch(`${MOCK}/__page-cap`, { method: 'POST', body: JSON.stringify({ size: 7 }) });
+  await fetch(`${MOCK}/__fail-next`, { method: 'POST', body: JSON.stringify({ status: 503, match: 'GET /api/v1/partner/stores/store-1/listings', skip: 1 }) });
+  m0 = mark();
+  const fs2 = await step('mirror_full_sync');
+  L = await mockListings();
+  ok('a scan page failing: nothing is switched off, and it is logged', fs2.finished && scansSince(m0).length === 2 && batchesSince(m0).length === 0 && foreign.every((r) => listingByRef(L, r)?.isActive === true) && fs2.activity.some((a) => /^Mirror skipped: could not read your Fetch listings \(HTTP 503/.test(a)), { activity: fs2.activity, scans: scansSince(m0).length });
+
+  m0 = mark();
+  const fs3 = await step('mirror_full_sync');
+  L = await mockListings();
+  const scans = scansSince(m0);
+  const batches = batchesSince(m0);
+  const rows = batches.flatMap((r) => r.body.items);
+  ok('mirror on: the scan pages through every listing with limit 500 and nextCursor', scans.length === Math.ceil(L.length / 7) && scans.every((r, i) => r.query.limit === '500' && (i === 0) === !r.query.cursor), scans.map((r) => r.query));
+  ok('mirror on: the extra, no-ref, filtered-out and deleted listings are switched off', foreign.every((r) => listingByRef(L, r)?.isActive === false) && L.find((l) => l.listingId === noRef.listingId).isActive === false, L.filter((l) => foreign.includes(l.ref) || !l.ref));
+  const oldOne = listingByRef(L, 'OLD-1');
+  ok('mirror on: rows always by the scanned listingId (never ref), each with the current price and isActive false', rows.length === 4 && rows.every((x) => x.isActive === false && /^\d+\.\d{2}$/.test(x.price) && typeof x.listingId === 'string' && x.ref === undefined && x.barcode === undefined) && rows.some((x) => x.listingId === noRef.listingId && x.price === '15.00') && rows.some((x) => x.listingId === oldOne?.listingId && x.price === '30.00'), rows);
+  ok('mirror on: the shop\'s products stay on sale; already-off listings are not touched', ['CBL-001', 'CASE-BLACK', 'CASE-WHITE'].every((r) => listingByRef(L, r)?.isActive === true) && !rows.some((x) => x.listingId === listingByRef(L, 'OLD-2')?.listingId), L.filter((l) => l.ref?.startsWith('C')));
+  ok('mirror on: run logged with scanned, kept, switched off and errors', fs3.activity.some((a) => new RegExp(`^Mirror: scanned ${L.length} Fetch listing\\(s\\), kept \\d+, switched off 4, 0 error\\(s\\)\\.$`).test(a)) && batches.every((r) => !!r.idem), fs3.activity);
+  ok('listings/batch requests pass the mock\'s live rules', mockLog().problems.length === 0, mockLog().problems);
+
+  m0 = mark();
+  const ra = await step('mirror_reactivate');
+  L = await mockListings();
+  const giftPut = mockLog().requests.slice(m0).filter((r) => r.method === 'PUT' && r.path.endsWith('/products')).flatMap((r) => r.body.products).find((x) => x.ref === 'GIFT-CARD');
+  ok('a product that comes back is switched on again by the normal sync', ra.sent === 1 && giftPut?.isActive === true && listingByRef(L, 'GIFT-CARD')?.isActive === true, { ra, giftPut });
+  m0 = mark();
+  const fs4 = await step('mirror_full_sync');
+  L = await mockListings();
+  ok('…and the next mirror run keeps it', batchesSince(m0).length === 0 && listingByRef(L, 'GIFT-CARD')?.isActive === true && fs4.activity.some((a) => /^Mirror: scanned \d+ Fetch listing\(s\), kept \d+, switched off 0, 0 error\(s\)\.$/.test(a)), fs4.activity);
+
+  // More than half would go: held until "Apply anyway"; then sent in requests of at most 200 rows.
+  const extra = Math.max(260, L.filter((l) => l.isActive).length + 10);
+  await fetch(`${MOCK}/__page-cap`, { method: 'POST', body: JSON.stringify({ size: 100 }) });
+  await fetch(`${MOCK}/__seed-listings`, { method: 'POST', body: JSON.stringify({ listings: Array.from({ length: extra }, (_, i) => ({ ref: `BULK-${i}`, name: `Wholesale item ${i}`, price: '2.50', isActive: true })) }) });
+  m0 = mark();
+  const fs5 = await step('mirror_full_sync');
+  L = await mockListings();
+  ok('over half: the run is held, nothing switched off, and logged', batchesSince(m0).length === 0 && fs5.pending?.off === extra && L.filter((l) => l.ref?.startsWith('BULK-')).every((l) => l.isActive) && fs5.activity.some((a) => a.startsWith(`Mirror held: it would switch off ${extra} of `)), { pending: fs5.pending, activity: fs5.activity });
+  ok('over half: the module page shows a notice with "Apply anyway"', fs5.notice.includes('submitFetchsyncMirrorApply') && fs5.notice.includes('Apply anyway') && fs5.notice.includes(`switched off ${extra} of the`), fs5.notice.slice(0, 600));
+  m0 = mark();
+  const ap = await step('mirror_apply');
+  L = await mockListings();
+  const applied = batchesSince(m0);
+  ok('"Apply anyway" switches them off and clears the notice', ap.messages.some((x) => x.includes(`Mirror applied: ${extra} Fetch product(s) switched off`)) && ap.pending === null && ap.notice === '' && ap.settings_kept && L.filter((l) => l.ref?.startsWith('BULK-')).every((l) => !l.isActive), ap);
+  ok(`batching: ${extra} rows go in requests of at most 200`, applied.length === Math.ceil(extra / 200) && applied.every((r) => r.body.items.length <= 200) && applied.reduce((n, r) => n + r.body.items.length, 0) === extra && new Set(applied.map((r) => r.idem)).size === applied.length, applied.map((r) => r.body.items.length));
+  ok('the shop\'s products are still on sale after "Apply anyway"', ['CBL-001', 'CASE-BLACK', 'GIFT-CARD'].every((r) => listingByRef(L, r)?.isActive === true), ['CBL-001', 'CASE-BLACK', 'GIFT-CARD'].map((r) => listingByRef(L, r)));
+  ok('all listings/batch requests still pass the mock\'s live rules', mockLog().problems.length === 0, mockLog().problems);
+  const allPuts = mockLog().requests.filter((r) => r.method === 'PUT' && r.path.endsWith('/products'));
+  const bodies = allPuts.map((r) => JSON.stringify(r.body));
+  ok('every product push has its own idempotency key, even when the payload repeats', allPuts.every((r) => /^ps-[0-9a-f]{32}$/.test(r.idem || '')) && new Set(allPuts.map((r) => r.idem)).size === allPuts.length && new Set(bodies).size < bodies.length, { puts: allPuts.length, keys: new Set(allPuts.map((r) => r.idem)).size, distinctBodies: new Set(bodies).size });
 } catch (e) {
   console.error('E2E ERROR', e);
   results.push(['FAIL', 'runner error: ' + e.message]);

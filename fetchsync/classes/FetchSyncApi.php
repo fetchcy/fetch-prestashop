@@ -12,7 +12,7 @@ if (!defined('_PS_VERSION_')) {
 
 class FetchSyncApi
 {
-    const VERSION = '1.0.0';
+    const VERSION = '1.1.0';
 
     /** @var string */
     private $baseUrl;
@@ -47,6 +47,17 @@ class FetchSyncApi
     public function upsertProducts($storeId, array $products, $idempotencyKey = null)
     {
         return $this->partner('PUT', 'stores/' . rawurlencode($storeId) . '/products', array('products' => $products), array(), $idempotencyKey);
+    }
+
+    /** One page of the store's listings: {data, nextCursor}. */
+    public function listListings($storeId, array $query = array())
+    {
+        return $this->partner('GET', 'stores/' . rawurlencode($storeId) . '/listings', null, $query);
+    }
+
+    public function batchListings($storeId, array $items, $idempotencyKey)
+    {
+        return $this->partner('POST', 'stores/' . rawurlencode($storeId) . '/listings/batch', array('items' => $items), array(), $idempotencyKey);
     }
 
     public function listOrders($storeId, array $query = array())

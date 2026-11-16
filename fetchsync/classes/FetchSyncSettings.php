@@ -10,6 +10,10 @@ class FetchSyncSettings
 {
     const PREFIX = 'FETCHSYNC_';
 
+    /** Catalogue modes: add and update only (default), or mirror the shop 1:1. */
+    const MODE_ADD = 'add_update';
+    const MODE_MIRROR = 'mirror';
+
     /**
      * Sandbox keys are issued on production too (the key, not the server,
      * decides test data), so staging is only for keys Fetch moved there.
@@ -27,6 +31,8 @@ class FetchSyncSettings
         'LAST_TICK',
         'SALES_CHECKED',
         'BULK_RUNNING',
+        'BULK_FAILED',
+        'MIRROR_PENDING',
         'PLACEHOLDER_ID',
         'CARRIER_REF',
         'OS_AWAITING',
@@ -49,6 +55,7 @@ class FetchSyncSettings
             'auto_accept' => 'no',
             'prep_minutes' => 15,
             'price_markup' => '0',
+            'catalogue_mode' => self::MODE_ADD,
             'webhook_secret' => '',
             'webhook_registered' => '',
             'cron_token' => '',
@@ -166,6 +173,17 @@ class FetchSyncSettings
         $value = str_replace(array(',', '%', ' '), array('.', '', ''), trim((string) $raw));
 
         return '' === $value || is_numeric($value);
+    }
+
+    /** "mirror" or "add_update"; anything else is the default, add and update only. */
+    public static function sanitizeCatalogueMode($raw)
+    {
+        return self::MODE_MIRROR === (string) $raw ? self::MODE_MIRROR : self::MODE_ADD;
+    }
+
+    public static function mirrorMode()
+    {
+        return self::MODE_MIRROR === self::sanitizeCatalogueMode(self::get('catalogue_mode'));
     }
 
     public static function defaultShopId()

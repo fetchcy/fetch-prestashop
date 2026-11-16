@@ -80,10 +80,11 @@ class FetchSyncProductMapper
         $name = self::plainName($product->name);
 
         $combinations = self::combinations($product, $idLang);
+        $refs = self::itemRefs($product, $combinations);
         if (!$combinations) {
             $item = array_merge(
                 array(
-                    'ref' => self::ref($id, 0, $product->reference),
+                    'ref' => $refs[0],
                     'name' => $name,
                     'productType' => 'SIMPLE',
                     'isActive' => $active,
@@ -103,16 +104,12 @@ class FetchSyncProductMapper
             return array(array($item, array($id, 0)));
         }
 
-        $counts = array_count_values(array_map(function ($combination) {
-            return trim($combination['reference']);
-        }, $combinations));
         $out = array();
         foreach ($combinations as $ipa => $combination) {
             $label = implode(' / ', array_filter($combination['values'], 'strlen'));
-            $shared = $counts[trim($combination['reference'])] > 1;
             $item = array_merge(
                 array(
-                    'ref' => self::ref($id, $ipa, $combination['reference'], $shared),
+                    'ref' => $refs[$ipa],
                     'name' => $name . ('' !== $label ? ' – ' . $label : ''),
                     'productType' => 'SIMPLE',
                     'isActive' => $active,
@@ -132,6 +129,43 @@ class FetchSyncProductMapper
         }
 
         return $out;
+    }
+
+    /**
+     * The refs this product keeps on sale on Fetch, without building the full
+     * items: none when it is not a type we sync or is inactive in the shop.
+     *
+     * @return string[]
+     */
+    public static function activeRefs(Product $product)
+    {
+        if (!self::supports($product) || !self::isActive($product)) {
+            return array();
+        }
+
+        return array_values(self::itemRefs($product, self::combinations($product, FetchSyncSettings::defaultLangId())));
+    }
+
+    /**
+     * id_product_attribute (0 without combinations) → ref.
+     *
+     * @return array<int,string>
+     */
+    private static function itemRefs(Product $product, array $combinations)
+    {
+        $id = (int) $product->id;
+        if (!$combinations) {
+            return array(0 => self::ref($id, 0, $product->reference));
+        }
+        $counts = array_count_values(array_map(function ($combination) {
+            return trim($combination['reference']);
+        }, $combinations));
+        $refs = array();
+        foreach ($combinations as $ipa => $combination) {
+            $refs[$ipa] = self::ref($id, $ipa, $combination['reference'], $counts[trim($combination['reference'])] > 1);
+        }
+
+        return $refs;
     }
 
     /** Full items with isActive=false (live Fetch requires a price on every row). */
