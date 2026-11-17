@@ -93,6 +93,32 @@ function e2e_simple($name, $reference, $priceIncl, $qty, $taxGroup)
     return $p;
 }
 
+/** The same text in every installed language. */
+function e2e_langs($text)
+{
+    $out = array();
+    foreach (Language::getIDs(false) as $id) {
+        $out[(int) $id] = $text;
+    }
+
+    return $out;
+}
+
+/** A new feature with one custom value: [id_feature, id_feature_value]. */
+function e2e_feature($name, $value)
+{
+    $feature = new Feature();
+    $feature->name = e2e_langs($name);
+    $feature->add();
+    $featureValue = new FeatureValue();
+    $featureValue->id_feature = (int) $feature->id;
+    $featureValue->value = e2e_langs($value);
+    $featureValue->custom = 1;
+    $featureValue->add();
+
+    return array((int) $feature->id, (int) $featureValue->id);
+}
+
 function e2e_order_state($idOrder)
 {
     $order = new Order((int) $idOrder);
@@ -235,6 +261,19 @@ switch ($step) {
             $combination->setAttributes(array($idAttribute));
             StockAvailable::setQuantity((int) $case->id, (int) $ipa, $qty);
             $out['attributes'][$colour] = $idAttribute;
+        }
+        // A summary on the simple product; paragraphs, SEO meta and two features
+        // (attached out of position order) on the case, which every combination carries.
+        $simple->description_short = e2e_langs('<p>Short <i>summary</i></p>');
+        $simple->update();
+        $case->description = e2e_langs('<p>Slim case.</p><p>Fits <b>most</b> phones.</p>');
+        $case->meta_title = e2e_langs('Phone Case | Mock Shop');
+        $case->meta_description = e2e_langs('A slim case.');
+        $case->update();
+        $height = e2e_feature('Height', '1 cm');
+        $material = e2e_feature('Material', 'Silicone');
+        foreach (array($material, $height) as $feature) {
+            $db->insert('feature_product', array('id_feature' => $feature[0], 'id_product' => (int) $case->id, 'id_feature_value' => $feature[1]));
         }
         $out['pending'] = array_map('intval', array_column($db->executeS('SELECT id_product FROM ' . _DB_PREFIX_ . 'fetchsync_queue'), 'id_product'));
         $out['simple_id'] = (int) $simple->id;

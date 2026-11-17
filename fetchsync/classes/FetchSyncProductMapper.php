@@ -11,7 +11,7 @@
  * product with combinations is sent as one simple product per combination:
  * its own ref (the combination reference), "Product – Black / M" as the name,
  * its own price, stock, barcode and images, and the product's description,
- * brand, category and tags.
+ * summary, brand, category, tags, features (specs) and SEO meta.
  */
 if (!defined('_PS_VERSION_')) {
     exit;
@@ -223,17 +223,93 @@ class FetchSyncProductMapper
         return self::money($marked / 100);
     }
 
+    /**
+     * HTML as plain text that keeps its paragraphs: block ends become "\n\n",
+     * <br> and list items "\n". Fetch shows "\n\n" as a paragraph break.
+     */
     public static function plainText($html)
     {
-        $text = str_replace("\xC2\xA0", ' ', html_entity_decode(strip_tags((string) $html), ENT_QUOTES, 'UTF-8'));
-        $text = trim(preg_replace('/\s+/u', ' ', $text));
+        // Byte-level patterns (no /u): invalid UTF-8 must not empty the text.
+        $html = preg_replace('/[ \t\r\n\f]+/', ' ', (string) $html);
+        $html = preg_replace('~<br\s*/?>~i', "\n", $html);
+        $html = preg_replace('~</(p|div|h[1-6]|ul|ol|table|blockquote|pre|section|article)\s*>~i', "\n\n", $html);
+        $html = preg_replace('~</(li|tr|dt|dd)\s*>~i', "\n", $html);
+        $text = str_replace("\xC2\xA0", ' ', html_entity_decode(strip_tags($html), ENT_QUOTES, 'UTF-8'));
+        $text = preg_replace('/[ \t\r\f]+/', ' ', $text);
+        $text = preg_replace('/ ?\n ?/', "\n", $text);
+        $text = trim(preg_replace('/\n{3,}/', "\n\n", $text));
 
-        return function_exists('mb_substr') ? mb_substr($text, 0, 5000) : substr($text, 0, 5000);
+        return self::cut($text, 5000);
+    }
+
+    /**
+     * Feature rows (name, value, in position order) as Fetch specs. A feature
+     * with several values is one spec, its values joined with ", ".
+     *
+     * @param array<int,array<string,mixed>> $rows
+     *
+     * @return array<int,array{name:string,value:string}>
+     */
+    public static function specs(array $rows)
+    {
+        $byName = array();
+        foreach ($rows as $row) {
+            $name = self::cut(self::oneLine(isset($row['name']) ? $row['name'] : ''), 100);
+            $value = self::oneLine(isset($row['value']) ? $row['value'] : '');
+            if ('' === $name || '' === $value) {
+                continue;
+            }
+            $key = function_exists('mb_strtolower') ? mb_strtolower($name, 'UTF-8') : strtolower($name);
+            if (!isset($byName[$key])) {
+                $byName[$key] = array('name' => $name, 'values' => array());
+            }
+            if (!in_array($value, $byName[$key]['values'], true)) {
+                $byName[$key]['values'][] = $value;
+            }
+        }
+        $specs = array();
+        foreach (array_slice($byName, 0, 100) as $spec) {
+            $specs[] = array('name' => $spec['name'], 'value' => self::cut(implode(', ', $spec['values']), 1000));
+        }
+
+        return $specs;
+    }
+
+    /**
+     * The shop's own meta title and description, or null when both are empty.
+     *
+     * @return array{title?:string,description?:string}|null
+     */
+    public static function seo($title, $description)
+    {
+        $seo = array();
+        $title = self::cut(self::oneLine($title), 255);
+        if ('' !== $title) {
+            $seo['title'] = $title;
+        }
+        $description = self::cut(self::oneLine($description), 1000);
+        if ('' !== $description) {
+            $seo['description'] = $description;
+        }
+
+        return $seo ? $seo : null;
     }
 
     private static function plainName($name)
     {
         return trim(html_entity_decode(strip_tags((string) $name), ENT_QUOTES, 'UTF-8'));
+    }
+
+    private static function oneLine($text)
+    {
+        $text = str_replace("\xC2\xA0", ' ', html_entity_decode(strip_tags((string) $text), ENT_QUOTES, 'UTF-8'));
+
+        return trim(preg_replace('/[ \t\r\n\f]+/', ' ', $text));
+    }
+
+    private static function cut($text, $length)
+    {
+        return function_exists('mb_substr') ? mb_substr($text, 0, $length, 'UTF-8') : substr($text, 0, $length);
     }
 
     /** @return array<int,string> */
@@ -348,13 +424,17 @@ class FetchSyncProductMapper
         return max(0, (int) StockAvailable::getQuantityAvailableByProduct((int) $idProduct, (int) $idProductAttribute, FetchSyncSettings::defaultShopId()));
     }
 
-    /** Description, brand, category and tags, shared by a product's combinations. */
+    /** Description, summary, brand, category, tags, specs and SEO, shared by a product's combinations. */
     private static function sharedFields(Product $product, $idLang)
     {
         $fields = array();
         $description = self::plainText($product->description ? $product->description : $product->description_short);
         if ('' !== $description) {
             $fields['description'] = $description;
+        }
+        $short = self::plainText($product->description_short);
+        if ('' !== $short) {
+            $fields['shortDescription'] = $short;
         }
         if ($product->id_manufacturer) {
             $brand = Manufacturer::getNameById((int) $product->id_manufacturer);
@@ -369,6 +449,14 @@ class FetchSyncProductMapper
         $tags = Tag::getProductTags((int) $product->id);
         if (is_array($tags) && !empty($tags[$idLang])) {
             $fields['tags'] = array_values($tags[$idLang]);
+        }
+        $specs = self::specs((array) Product::getFrontFeaturesStatic((int) $idLang, (int) $product->id));
+        if ($specs) {
+            $fields['specs'] = $specs;
+        }
+        $seo = self::seo($product->meta_title, $product->meta_description);
+        if ($seo) {
+            $fields['seo'] = $seo;
         }
 
         return $fields;

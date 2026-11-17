@@ -35,7 +35,7 @@ It uses the [Fetch Partner API](https://developer.fetch.com.cy) and works the sa
 
 1. Ask Fetch for a **Partner API key** for your store.
    You receive a **client ID** and a **client secret**.
-2. In the back office, go to **Modules → Module Manager → Upload a module** and upload `fetchsync-1.1.0.zip`.
+2. In the back office, go to **Modules → Module Manager → Upload a module** and upload `fetchsync-1.2.0.zip`.
    PrestaShop installs it.
 3. Press **Configure** on the **Fetch** module.
 4. Enter your client ID and client secret, press **Save settings**, then press **Connect & load stores** and choose your Fetch store.
@@ -93,7 +93,10 @@ Fetch maintains the name, photos and category of shared catalogue products.
 
 | PrestaShop | Fetch |
 |---|---|
-| Name, description (or summary) | Name, description (HTML is stripped) |
+| Name, description (or summary) | Name, description (HTML is stripped, paragraphs are kept) |
+| Summary (short description) | Short description |
+| Features, in their position order | Specs (name and value; a feature with several values is one spec) |
+| SEO meta title and meta description | The shop's SEO title and description |
 | Price, specific prices (sales) | Price and sale price, **VAT included**, as an anonymous visitor in your shop's default country would pay, plus the price markup |
 | Quantity (stock management on) | Exact quantity (never below 0) |
 | Stock management off | Sold without a stock limit |
@@ -111,7 +114,7 @@ Packs and virtual products are not.
 
 Fetch lists each combination as its own product.
 A T-shirt in sizes S, M and L becomes three Fetch products, for example **"Logo T-shirt – Black / M"**, each with its own reference, price, stock, barcode and images.
-The product's description, brand, category and tags are shared by all of them.
+The product's description, summary, brand, category, tags, features and SEO meta are shared by all of them.
 A combination only uses its own barcode, never the product's.
 
 ### Timing
@@ -265,7 +268,7 @@ Other shops of a multistore installation are not synced.
 php tests/unit.php
 
 # Build the module ZIP (fetchsync/ at the zip root)
-./build.sh            # → dist/fetchsync-1.1.0.zip
+./build.sh            # → dist/fetchsync-1.2.0.zip
 
 # End-to-end: PrestaShop 8.1 + MariaDB in Docker, the release ZIP, and a mock Fetch API
 node tests/e2e/run.mjs
