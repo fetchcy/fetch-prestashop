@@ -45,6 +45,7 @@ class Fetchsync extends PaymentModule
         'displayAdminOrderSide',
         'displayBackOfficeHeader',
         'actionDispatcher',
+        'actionShopDataDuplication',
     );
 
     public function __construct()
@@ -80,6 +81,8 @@ class Fetchsync extends PaymentModule
                 return false;
             }
         }
+        // Every shop gets the carrier and the placeholder product (the hooks are registered for all shops above).
+        FetchSyncInstaller::ensureAllShops();
 
         return true;
     }
@@ -92,11 +95,22 @@ class Fetchsync extends PaymentModule
     public function getContent()
     {
         FetchSyncContext::background();
+        FetchSyncSettings::adoptLegacy();
 
         return (new FetchSyncAdmin($this))->content();
     }
 
+    /** A new shop copied from another one: give it the carrier, the placeholder product and the hooks. */
+    public function hookActionShopDataDuplication($params)
+    {
+        if (!empty($params['new_id_shop'])) {
+            FetchSyncInstaller::ensureShop((int) $params['new_id_shop']);
+        }
+    }
+
     // --- Product sync -------------------------------------------------------
+    // Each change is queued for every connected shop that sells the product
+    // and has "Sync to Fetch" on (FetchSyncProductSync::queue()).
 
     public function hookActionObjectProductAddAfter($params)
     {
@@ -110,14 +124,14 @@ class Fetchsync extends PaymentModule
 
     public function hookActionProductUpdate($params)
     {
-        if ($this->syncing() && !empty($params['id_product'])) {
+        if (!empty($params['id_product'])) {
             FetchSyncProductSync::queue((int) $params['id_product']);
         }
     }
 
     public function hookActionObjectProductDeleteBefore($params)
     {
-        if ($this->syncing() && isset($params['object']) && $params['object'] instanceof Product) {
+        if (isset($params['object']) && $params['object'] instanceof Product) {
             FetchSyncProductSync::queueDeletion($params['object']);
         }
     }
@@ -134,7 +148,7 @@ class Fetchsync extends PaymentModule
 
     public function hookActionObjectCombinationDeleteBefore($params)
     {
-        if ($this->syncing() && isset($params['object']) && $params['object'] instanceof Combination) {
+        if (isset($params['object']) && $params['object'] instanceof Combination) {
             FetchSyncProductSync::queueCombinationDeletion($params['object']);
             FetchSyncProductSync::queue((int) $params['object']->id_product);
         }
@@ -157,7 +171,7 @@ class Fetchsync extends PaymentModule
 
     public function hookActionUpdateQuantity($params)
     {
-        if ($this->syncing() && !empty($params['id_product'])) {
+        if (!empty($params['id_product'])) {
             FetchSyncProductSync::queue((int) $params['id_product']);
         }
     }
@@ -173,14 +187,9 @@ class Fetchsync extends PaymentModule
 
     private function queueObject($object, $field)
     {
-        if ($this->syncing() && is_object($object) && !empty($object->{$field})) {
+        if (is_object($object) && !empty($object->{$field})) {
             FetchSyncProductSync::queue((int) $object->{$field});
         }
-    }
-
-    private function syncing()
-    {
-        return FetchSyncSettings::enabled('sync_products');
     }
 
     // --- Orders -------------------------------------------------------------

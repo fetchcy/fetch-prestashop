@@ -4,6 +4,11 @@
  *
  * Uninstall drops the module's tables and settings and retires the carrier.
  * Order states and the placeholder product stay: existing orders use them.
+ *
+ * Order states are global in PrestaShop. The carrier and the placeholder
+ * product are associated with every shop, including shops created later
+ * (actionShopDataDuplication, and ensureShop() before a shop is configured or
+ * gets an order).
  */
 if (!defined('_PS_VERSION_')) {
     exit;
@@ -56,22 +61,25 @@ class FetchSyncInstaller
         $p = _DB_PREFIX_;
         $sql = array(
             "CREATE TABLE IF NOT EXISTS `{$p}fetchsync_queue` (
+                `id_shop` INT UNSIGNED NOT NULL DEFAULT 0,
                 `id_product` INT UNSIGNED NOT NULL,
                 `version` INT UNSIGNED NOT NULL DEFAULT 1,
                 `attempts` INT UNSIGNED NOT NULL DEFAULT 0,
                 `next_try` INT UNSIGNED NOT NULL DEFAULT 0,
                 `date_add` DATETIME NOT NULL,
-                PRIMARY KEY (`id_product`),
+                PRIMARY KEY (`id_shop`, `id_product`),
                 KEY `next_try` (`next_try`)
             ) ENGINE={$engine} DEFAULT CHARSET=utf8mb4",
             "CREATE TABLE IF NOT EXISTS `{$p}fetchsync_deactivation` (
+                `id_shop` INT UNSIGNED NOT NULL DEFAULT 0,
                 `ref` VARCHAR(191) NOT NULL,
                 `payload` MEDIUMTEXT NOT NULL,
                 `attempts` INT UNSIGNED NOT NULL DEFAULT 0,
                 `next_try` INT UNSIGNED NOT NULL DEFAULT 0,
-                PRIMARY KEY (`ref`)
+                PRIMARY KEY (`id_shop`, `ref`)
             ) ENGINE={$engine} DEFAULT CHARSET=utf8mb4",
             "CREATE TABLE IF NOT EXISTS `{$p}fetchsync_product` (
+                `id_shop` INT UNSIGNED NOT NULL DEFAULT 0,
                 `id_product` INT UNSIGNED NOT NULL,
                 `id_product_attribute` INT UNSIGNED NOT NULL DEFAULT 0,
                 `ref` VARCHAR(191) NOT NULL DEFAULT '',
@@ -79,11 +87,12 @@ class FetchSyncInstaller
                 `status` VARCHAR(16) NOT NULL DEFAULT '',
                 `error` TEXT NULL,
                 `synced_at` INT UNSIGNED NOT NULL DEFAULT 0,
-                PRIMARY KEY (`id_product`, `id_product_attribute`),
-                KEY `ref` (`ref`)
+                PRIMARY KEY (`id_shop`, `id_product`, `id_product_attribute`),
+                KEY `ref` (`id_shop`, `ref`)
             ) ENGINE={$engine} DEFAULT CHARSET=utf8mb4",
             "CREATE TABLE IF NOT EXISTS `{$p}fetchsync_order` (
                 `fetch_order_id` VARCHAR(64) NOT NULL,
+                `id_shop` INT UNSIGNED NOT NULL DEFAULT 0,
                 `id_order` INT UNSIGNED NOT NULL DEFAULT 0,
                 `fetch_order_number` VARCHAR(64) NOT NULL DEFAULT '',
                 `fetch_store_id` VARCHAR(64) NOT NULL DEFAULT '',
@@ -93,7 +102,8 @@ class FetchSyncInstaller
                 `date_add` INT UNSIGNED NOT NULL DEFAULT 0,
                 `date_upd` INT UNSIGNED NOT NULL DEFAULT 0,
                 PRIMARY KEY (`fetch_order_id`),
-                KEY `id_order` (`id_order`)
+                KEY `id_order` (`id_order`),
+                KEY `id_shop` (`id_shop`)
             ) ENGINE={$engine} DEFAULT CHARSET=utf8mb4",
             "CREATE TABLE IF NOT EXISTS `{$p}fetchsync_event` (
                 `event_id` VARCHAR(191) NOT NULL,
@@ -103,10 +113,12 @@ class FetchSyncInstaller
             ) ENGINE={$engine} DEFAULT CHARSET=utf8mb4",
             "CREATE TABLE IF NOT EXISTS `{$p}fetchsync_log` (
                 `id_fetchsync_log` INT UNSIGNED NOT NULL AUTO_INCREMENT,
+                `id_shop` INT UNSIGNED NOT NULL DEFAULT 0,
                 `level` VARCHAR(8) NOT NULL,
                 `message` TEXT NOT NULL,
                 `date_add` DATETIME NOT NULL,
-                PRIMARY KEY (`id_fetchsync_log`)
+                PRIMARY KEY (`id_fetchsync_log`),
+                KEY `id_shop` (`id_shop`)
             ) ENGINE={$engine} DEFAULT CHARSET=utf8mb4",
         );
         foreach ($sql as $query) {
@@ -223,7 +235,7 @@ class FetchSyncInstaller
             $range->delimiter1 = 0;
             $range->delimiter2 = 1000000000;
             $range->add();
-            // addZone() also gives each zone a 0 price on the range above.
+            // addZone() also gives each zone a 0 price on the range above (for every shop).
             foreach (Zone::getZones() as $zone) {
                 $carrier->addZone((int) $zone['id_zone']);
             }
@@ -254,19 +266,131 @@ class FetchSyncInstaller
 
     public static function installDefaults()
     {
-        $current = Configuration::getGlobalValue(FetchSyncSettings::key('cron_token'));
         $values = array();
-        foreach (FetchSyncSettings::defaults() as $name => $default) {
-            if (false === Configuration::getGlobalValue(FetchSyncSettings::key($name))) {
-                $values[$name] = $default;
-            }
-        }
-        if (!$current) {
+        if (!Configuration::getGlobalValue(FetchSyncSettings::key('cron_token'))) {
             $values['cron_token'] = Tools::passwdGen(32);
         }
+        // Without multistore the defaults are stored the way 1.2.0 stored them.
+        if (!FetchSyncSettings::multistore()) {
+            foreach (FetchSyncSettings::defaults() as $name => $default) {
+                if ('cron_token' !== $name && false === Configuration::getGlobalValue(FetchSyncSettings::key($name))) {
+                    $values[$name] = $default;
+                }
+            }
+        }
         FetchSyncSettings::update($values);
+        FetchSyncSettings::adoptLegacy();
 
         return true;
+    }
+
+    public static function ensureAllShops()
+    {
+        $ok = true;
+        foreach (FetchSyncSettings::shopIds() as $idShop) {
+            $ok = self::ensureShop($idShop) && $ok;
+        }
+
+        return $ok;
+    }
+
+    /**
+     * Associate the module, its hooks, the carrier and the placeholder product
+     * with a shop (one created after install, or created without the module's
+     * data). Cheap when everything is already there.
+     */
+    public static function ensureShop($idShop)
+    {
+        $idShop = (int) $idShop;
+        if ($idShop <= 0) {
+            return false;
+        }
+        $db = Db::getInstance();
+        $ok = true;
+
+        $module = Module::getInstanceByName('fetchsync');
+        if ($module && $module->id) {
+            if (!$db->getValue('SELECT 1 FROM `' . _DB_PREFIX_ . 'module_shop` WHERE `id_module` = ' . (int) $module->id . ' AND `id_shop` = ' . $idShop)) {
+                $ok = $db->insert('module_shop', array('id_module' => (int) $module->id, 'id_shop' => $idShop)) && $ok;
+            }
+            $hooked = $db->executeS(
+                'SELECT LOWER(h.`name`) AS `name` FROM `' . _DB_PREFIX_ . 'hook_module` hm
+                INNER JOIN `' . _DB_PREFIX_ . 'hook` h ON h.`id_hook` = hm.`id_hook`
+                WHERE hm.`id_module` = ' . (int) $module->id . ' AND hm.`id_shop` = ' . $idShop
+            );
+            $hooked = array_column(is_array($hooked) ? $hooked : array(), 'name');
+            $missing = array_values(array_filter(Fetchsync::HOOKS, function ($hook) use ($hooked) {
+                return !in_array(strtolower($hook), $hooked, true);
+            }));
+            if ($missing) {
+                $ok = $module->registerHook($missing, array($idShop)) && $ok;
+            }
+        }
+
+        $placeholder = (int) FetchSyncSettings::internal('PLACEHOLDER_ID', 0);
+        if ($placeholder) {
+            if (!$db->getValue('SELECT 1 FROM `' . _DB_PREFIX_ . 'product_shop` WHERE `id_product` = ' . $placeholder . ' AND `id_shop` = ' . $idShop)) {
+                $from = self::sourceShop('product_shop', '`id_product` = ' . $placeholder);
+                if ($from) {
+                    $ok = self::copyShopRows('product_shop', '`id_product` = ' . $placeholder, $from, $idShop) && $ok;
+                    $ok = self::copyShopRows('product_lang', '`id_product` = ' . $placeholder, $from, $idShop) && $ok;
+                }
+            }
+            StockAvailable::setProductOutOfStock($placeholder, 1, $idShop);
+        }
+
+        $carrier = self::carrier();
+        if (Validate::isLoadedObject($carrier)) {
+            $where = '`id_carrier` = ' . (int) $carrier->id;
+            if (!$db->getValue('SELECT 1 FROM `' . _DB_PREFIX_ . 'carrier_shop` WHERE ' . $where . ' AND `id_shop` = ' . $idShop)) {
+                $ok = $db->insert('carrier_shop', array('id_carrier' => (int) $carrier->id, 'id_shop' => $idShop)) && $ok;
+            }
+            if (!$db->getValue('SELECT 1 FROM `' . _DB_PREFIX_ . 'carrier_lang` WHERE ' . $where . ' AND `id_shop` = ' . $idShop)) {
+                $from = self::sourceShop('carrier_lang', $where);
+                if ($from) {
+                    $ok = self::copyShopRows('carrier_lang', $where, $from, $idShop) && $ok;
+                }
+            }
+            if (!$db->getValue('SELECT 1 FROM `' . _DB_PREFIX_ . 'carrier_tax_rules_group_shop` WHERE ' . $where . ' AND `id_shop` = ' . $idShop)) {
+                $from = self::sourceShop('carrier_tax_rules_group_shop', $where);
+                if ($from) {
+                    $ok = self::copyShopRows('carrier_tax_rules_group_shop', $where, $from, $idShop) && $ok;
+                }
+            }
+        }
+
+        return (bool) $ok;
+    }
+
+    /** The default shop when it has the rows, otherwise the first shop that has them. */
+    private static function sourceShop($table, $where)
+    {
+        $rows = Db::getInstance()->executeS('SELECT DISTINCT `id_shop` FROM `' . _DB_PREFIX_ . $table . '` WHERE ' . $where . ' ORDER BY `id_shop`');
+        $ids = array_map('intval', array_column(is_array($rows) ? $rows : array(), 'id_shop'));
+        $default = (int) Configuration::get('PS_SHOP_DEFAULT');
+
+        return in_array($default, $ids, true) ? $default : ($ids ? $ids[0] : 0);
+    }
+
+    /** Copy one shop's rows of a *_shop or *_lang table to another shop, column for column. */
+    private static function copyShopRows($table, $where, $fromShop, $toShop)
+    {
+        $columns = Db::getInstance()->executeS('SHOW COLUMNS FROM `' . _DB_PREFIX_ . $table . '`');
+        $names = array();
+        $select = array();
+        foreach (is_array($columns) ? $columns : array() as $column) {
+            $names[] = '`' . bqSQL($column['Field']) . '`';
+            $select[] = 'id_shop' === $column['Field'] ? (int) $toShop : '`' . bqSQL($column['Field']) . '`';
+        }
+        if (!$names) {
+            return false;
+        }
+
+        return Db::getInstance()->execute(
+            'INSERT IGNORE INTO `' . _DB_PREFIX_ . $table . '` (' . implode(', ', $names) . ')
+            SELECT ' . implode(', ', $select) . ' FROM `' . _DB_PREFIX_ . $table . '`
+            WHERE ' . $where . ' AND `id_shop` = ' . (int) $fromShop
+        );
     }
 
     private static function langField($value)

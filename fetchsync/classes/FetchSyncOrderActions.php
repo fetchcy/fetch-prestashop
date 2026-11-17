@@ -2,7 +2,8 @@
 /**
  * The "Fetch" block on the PrestaShop order page: status plus Accept /
  * Mark ready / Reject, each calling the Fetch API and then mirroring the
- * result onto the PrestaShop order.
+ * result onto the PrestaShop order. An order is handled with the settings
+ * (key, Fetch store) of the shop it belongs to.
  */
 if (!defined('_PS_VERSION_')) {
     exit;
@@ -44,7 +45,7 @@ class FetchSyncOrderActions
             'fetchsync_can_accept' => in_array('accept', $actions, true),
             'fetchsync_can_ready' => in_array('ready', $actions, true),
             'fetchsync_can_reject' => in_array('reject', $actions, true),
-            'fetchsync_prep_minutes' => (int) FetchSyncSettings::get('prep_minutes'),
+            'fetchsync_prep_minutes' => (int) FetchSyncSettings::getFor(self::shopOf($row), 'prep_minutes'),
             'fetchsync_reasons' => self::REJECT_REASONS,
             'fetchsync_url' => self::actionUrl(),
             'fetchsync_notice' => $notice,
@@ -71,7 +72,7 @@ class FetchSyncOrderActions
             $error = 'This is not a Fetch order.';
         } else {
             $error = self::run($idOrder, $action, array(
-                'prepMinutes' => Tools::getIsset('fetchsync_prep_minutes') ? (int) Tools::getValue('fetchsync_prep_minutes') : (int) FetchSyncSettings::get('prep_minutes'),
+                'prepMinutes' => Tools::getIsset('fetchsync_prep_minutes') ? (int) Tools::getValue('fetchsync_prep_minutes') : (int) FetchSyncSettings::getFor(self::shopOf(FetchSyncOrderSync::rowForOrder($idOrder)), 'prep_minutes'),
                 'reason' => (string) Tools::getValue('fetchsync_reason', 'OTHER'),
                 'note' => trim(strip_tags((string) Tools::getValue('fetchsync_note', ''))),
             ));
@@ -92,7 +93,32 @@ class FetchSyncOrderActions
         if (!$row) {
             return 'This is not a Fetch order.';
         }
-        $storeId = (string) FetchSyncSettings::get('store_id');
+
+        return FetchSyncContext::forShop(self::shopOf($row), function () use ($idOrder, $action, $args, $row) {
+            return FetchSyncOrderActions::runInShop($idOrder, $action, $args, $row);
+        });
+    }
+
+    /** The shop a Fetch order belongs to (rows from before 1.3.0 are the default shop's). */
+    public static function shopOf($row)
+    {
+        if (is_array($row) && !empty($row['id_shop'])) {
+            return (int) $row['id_shop'];
+        }
+        $idShop = is_array($row) ? (int) Db::getInstance()->getValue('SELECT `id_shop` FROM `' . _DB_PREFIX_ . 'orders` WHERE `id_order` = ' . (int) $row['id_order']) : 0;
+
+        return $idShop ? $idShop : FetchSyncSettings::defaultShopId();
+    }
+
+    /**
+     * run() with the order's shop settings in place.
+     *
+     * @internal used by run()
+     */
+    public static function runInShop($idOrder, $action, array $args, array $row)
+    {
+        // The store the order came from, even if the shop has switched stores since.
+        $storeId = '' !== (string) $row['fetch_store_id'] ? (string) $row['fetch_store_id'] : (string) FetchSyncSettings::get('store_id');
         $fetchId = (string) $row['fetch_order_id'];
         $api = new FetchSyncApi();
 

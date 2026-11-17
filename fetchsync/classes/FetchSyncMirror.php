@@ -11,6 +11,8 @@
  * Only which products are on sale, their price, stock and active state follow
  * the shop. Names, photos and descriptions live in Fetch's shared catalogue,
  * which other stores use too, and are not overwritten.
+ *
+ * With multistore it runs for one shop and its own Fetch store only.
  */
 if (!defined('_PS_VERSION_')) {
     exit;
@@ -261,7 +263,7 @@ class FetchSyncMirror
     {
         $rows = Db::getInstance()->executeS(
             'SELECT `id_product` FROM `' . _DB_PREFIX_ . 'product_shop`
-            WHERE `id_shop` = ' . FetchSyncSettings::defaultShopId() . '
+            WHERE `id_shop` = ' . FetchSyncSettings::shopId() . '
             AND `id_product` <> ' . (int) FetchSyncSettings::internal('PLACEHOLDER_ID', 0) . '
             ORDER BY `id_product`'
         );
