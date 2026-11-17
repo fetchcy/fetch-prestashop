@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.0 (beta)
+
+- **Specs.** Product features are sent to Fetch as specs (name and value), in the order the shop shows them.
+  A feature with several values is sent once, with its values joined by commas.
+- **Summary.** The short description is sent as well as the description.
+- **SEO.** The product's meta title and meta description are sent, so Fetch can use the shop's own SEO text.
+- Descriptions keep their paragraphs and line breaks instead of being flattened to one line.
+- Every combination carries its product's specs, summary and SEO, like the description and brand.
+- Text and SEO come from the shop's default language, like the name.
+  All the new fields are optional, so older Fetch servers keep accepting the module's updates.
+
 ## 1.1.0 (beta)
 
 - **Mirror this shop 1:1.** A new **Catalogue mode** setting.

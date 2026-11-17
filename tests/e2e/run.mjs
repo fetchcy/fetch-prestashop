@@ -128,7 +128,7 @@ try {
   cronToken = new URL(cfg.cron_url).searchParams.get('token');
   let log = mockLog();
   ok('token request is client_credentials', log.requests.some((r) => r.path === '/api/v1/oauth/token' && r.body?.grant_type === 'client_credentials' && r.body?.client_id === 'client-1'));
-  ok('User-Agent identifies the module', log.requests.some((r) => /^FetchForPrestaShop\/1\.1\.0/.test(r.ua || '')), log.requests.at(-1)?.ua);
+  ok('User-Agent identifies the module', log.requests.some((r) => /^FetchForPrestaShop\/1\.2\.0/.test(r.ua || '')), log.requests.at(-1)?.ua);
 
   // --- Products ---------------------------------------------------------------
   const prod = await step('create_products');
@@ -141,6 +141,12 @@ try {
   const white = all.find((p) => p.ref === 'CASE-WHITE');
   ok('simple product: reference as ref, VAT-incl price 9.50, sale 7.00, stock 10, active', simple && simple.productType === 'SIMPLE' && simple.price === '9.50' && simple.salePrice === '7.00' && simple.stockCount === 10 && simple.isActive === true, simple);
   ok('description sent as plain text', simple?.description === 'USB-C Cable 1m for e2e', simple?.description);
+  ok('summary sent as shortDescription; no specs or seo without features or meta', simple?.shortDescription === 'Short summary' && !!simple && !('specs' in simple) && !('seo' in simple), simple);
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const caseSpecs = [{ name: 'Height', value: '1 cm' }, { name: 'Material', value: 'Silicone' }];
+  const caseSeo = { title: 'Phone Case | Mock Shop', description: 'A slim case.' };
+  ok('features sent as specs in position order, meta as seo, description paragraphs kept', same(black?.specs, caseSpecs) && same(black?.seo, caseSeo) && black?.description === 'Slim case.\n\nFits most phones.', black);
+  ok('every combination carries the parent\'s specs and seo', same(white?.specs, caseSpecs) && same(white?.seo, caseSeo), white);
   ok('combinations sent as one SIMPLE product each (live Fetch refuses VARIABLE)',
     !all.some((p) => p.productType === 'VARIABLE' || p.ref === 'CASE')
     && black?.productType === 'SIMPLE' && black.stockCount === 4 && black.price === '12.00' && black.name === 'Phone Case – Black'

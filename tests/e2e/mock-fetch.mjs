@@ -49,6 +49,22 @@ function validateProduct(p, i) {
   if (p.price !== undefined && !money(p.price)) problems.push(`${at}.price not 2-decimal string: ${p.price}`);
   if (p.salePrice !== undefined && !money(p.salePrice)) problems.push(`${at}.salePrice not 2-decimal string: ${p.salePrice}`);
   if (p.stockCount !== undefined && !Number.isInteger(p.stockCount)) problems.push(`${at}.stockCount not int`);
+  // Optional content fields (1.2.0): shortDescription, specs, seo, with the live limits.
+  if (p.shortDescription !== undefined && (typeof p.shortDescription !== 'string' || p.shortDescription.length > 5000)) problems.push(`${at}.shortDescription not a string of at most 5000`);
+  if (p.specs !== undefined) {
+    if (!Array.isArray(p.specs) || p.specs.length > 100) problems.push(`${at}.specs not an array of at most 100`);
+    else p.specs.forEach((s, j) => {
+      if (!s || typeof s.name !== 'string' || typeof s.value !== 'string' || !s.name || s.name.length > 100 || s.value.length > 1000 || Object.keys(s).some((k) => k !== 'name' && k !== 'value')) problems.push(`${at}.specs[${j}] not { name ≤ 100, value ≤ 1000 }`);
+    });
+  }
+  if (p.seo !== undefined) {
+    const seo = p.seo;
+    if (!seo || typeof seo !== 'object' || Array.isArray(seo) || Object.keys(seo).some((k) => k !== 'title' && k !== 'description')) problems.push(`${at}.seo not { title?, description? }`);
+    else {
+      if (seo.title !== undefined && (typeof seo.title !== 'string' || seo.title.length > 255)) problems.push(`${at}.seo.title not a string of at most 255`);
+      if (seo.description !== undefined && (typeof seo.description !== 'string' || seo.description.length > 1000)) problems.push(`${at}.seo.description not a string of at most 1000`);
+    }
+  }
 }
 
 function send(res, code, body, headers = {}) {

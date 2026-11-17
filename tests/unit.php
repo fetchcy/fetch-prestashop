@@ -2,10 +2,10 @@
 /**
  * Standalone unit tests (no PrestaShop): `php tests/unit.php`.
  * Covers webhook signature verification, the order mapping rules, the price
- * markup maths, the server setting, request batching and the mirror mode's
- * scan / plan / guard / switch-off logic against a fake Partner API. The
- * webhook, status, markup and mirror cases are the same as the WooCommerce
- * plugin's.
+ * markup maths, the product text, specs and SEO mapping, the server setting,
+ * request batching and the mirror mode's scan / plan / guard / switch-off
+ * logic against a fake Partner API. The webhook, status, markup and mirror
+ * cases are the same as the WooCommerce plugin's.
  */
 define('_PS_VERSION_', '8.1.0');
 define('_DB_PREFIX_', 'ps_');
@@ -301,6 +301,42 @@ check('money pads decimals', FetchSyncProductMapper::money(7), '7.00');
 check('money rounds', FetchSyncProductMapper::money(9.499999), '9.50');
 check('plain text strips HTML and entities', FetchSyncProductMapper::plainText("<p>Fast&nbsp;<b>USB-C</b>\n cable &amp; more</p>"), 'Fast USB-C cable & more');
 check('plain text max 5000 chars', strlen(FetchSyncProductMapper::plainText(str_repeat('a', 6000))), 5000);
+check('plain text keeps paragraphs as a blank line', FetchSyncProductMapper::plainText("<p>First\n paragraph.</p>\n<p>Second &amp; last.</p>"), "First paragraph.\n\nSecond & last.");
+check('plain text: <br> and list items are line breaks', FetchSyncProductMapper::plainText('<p>Intro<br/>line two</p><ul><li>One</li><li> Two </li></ul><h3>Care</h3>Wash cold'), "Intro\nline two\n\nOne\nTwo\n\nCare\n\nWash cold");
+check('plain text: no more than one blank line in a row', FetchSyncProductMapper::plainText('<p>A</p><p>&nbsp;</p><div><p>B</p></div>'), "A\n\nB");
+check('plain text: Greek kept, cut by characters not bytes', FetchSyncProductMapper::plainText(str_repeat('Ω', 6000)), str_repeat('Ω', 5000));
+check('plain text of nothing', FetchSyncProductMapper::plainText(null), '');
+
+check('specs: feature rows in order, trimmed and decoded', FetchSyncProductMapper::specs(array(
+    array('name' => 'Height', 'value' => ' 80 cm ', 'id_feature' => 3, 'position' => 0),
+    array('name' => 'Material', 'value' => 'Oak &amp; steel', 'id_feature' => 1, 'position' => 1),
+)), array(array('name' => 'Height', 'value' => '80 cm'), array('name' => 'Material', 'value' => 'Oak & steel')));
+check('specs: a feature with several values is one spec, values joined', FetchSyncProductMapper::specs(array(
+    array('name' => 'Colour', 'value' => 'Red'),
+    array('name' => 'Size', 'value' => 'L'),
+    array('name' => 'colour', 'value' => 'Blue'),
+    array('name' => 'Colour', 'value' => 'Red'),
+)), array(array('name' => 'Colour', 'value' => 'Red, Blue'), array('name' => 'Size', 'value' => 'L')));
+check('specs: empty names or values dropped', FetchSyncProductMapper::specs(array(
+    array('name' => '', 'value' => 'x'),
+    array('name' => 'Brand', 'value' => '  '),
+    array('name' => 'Μάρκα', 'value' => 'Θεσσαλία'),
+    array('value' => 'no name'),
+)), array(array('name' => 'Μάρκα', 'value' => 'Θεσσαλία')));
+$many = array();
+for ($i = 0; $i < 130; ++$i) {
+    $many[] = array('name' => 'F' . $i, 'value' => 'v');
+}
+check('specs: at most 100', count(FetchSyncProductMapper::specs($many)), 100);
+$long = FetchSyncProductMapper::specs(array(array('name' => str_repeat('n', 150), 'value' => str_repeat('v', 1200))));
+check('specs: name ≤ 100, value ≤ 1000 characters', array(strlen($long[0]['name']), strlen($long[0]['value'])), array(100, 1000));
+check('specs: none', FetchSyncProductMapper::specs(array()), array());
+
+check('seo: title and description', FetchSyncProductMapper::seo(' Oak table | Shop ', "Solid oak,\n seats 6."), array('title' => 'Oak table | Shop', 'description' => 'Solid oak, seats 6.'));
+check('seo: only what is set', FetchSyncProductMapper::seo('', 'Just a description'), array('description' => 'Just a description'));
+check('seo: nothing set → null', FetchSyncProductMapper::seo('  ', null), null);
+$seo = FetchSyncProductMapper::seo(str_repeat('t', 300), str_repeat('d', 1100));
+check('seo: title ≤ 255, description ≤ 1000', array(strlen($seo['title']), strlen($seo['description'])), array(255, 1000));
 $items = array();
 for ($i = 0; $i < 450; ++$i) {
     $items[] = array('ref' => 'r' . $i, 'name' => 'n', 'price' => '1.00');
