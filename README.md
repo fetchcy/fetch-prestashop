@@ -20,6 +20,7 @@ It uses the [Fetch Partner API](https://developer.fetch.com.cy) and works the sa
 - **Optional auto-accept** with your usual preparation time.
 - **Optional price markup** for the prices you show on Fetch.
 - **Optional mirror mode** that keeps your Fetch store to exactly the products this shop sells, with a preview and a safety check before anything is switched off.
+- **Multistore.** Every shop of a multistore installation can sell on its own Fetch store, with its own prices, stock and settings.
 
 ## Requirements
 
@@ -35,9 +36,10 @@ It uses the [Fetch Partner API](https://developer.fetch.com.cy) and works the sa
 
 1. Ask Fetch for a **Partner API key** for your store.
    You receive a **client ID** and a **client secret**.
-2. In the back office, go to **Modules → Module Manager → Upload a module** and upload `fetchsync-1.2.0.zip`.
+2. In the back office, go to **Modules → Module Manager → Upload a module** and upload `fetchsync-1.3.0.zip`.
    PrestaShop installs it.
 3. Press **Configure** on the **Fetch** module.
+   With multistore, first choose the shop in the shop selector at the top of the back office (see [Multistore](#multistore)).
 4. Enter your client ID and client secret, press **Save settings**, then press **Connect & load stores** and choose your Fetch store.
 5. Press **Sync all products now** to send your catalogue the first time.
    Large catalogues are sent in the background in batches of 50 products.
@@ -53,14 +55,21 @@ It uses the [Fetch Partner API](https://developer.fetch.com.cy) and works the sa
 Installing the module creates its own database tables, four order states, a hidden carrier called **Fetch delivery** and a hidden, inactive product called **Fetch item (not in your catalogue)**.
 Do not delete the carrier or the product; the module uses them to build Fetch orders.
 
+### Upgrading
+
+Upload the new ZIP the same way; PrestaShop runs the module's upgrade.
+Upgrading from 1.2.0 to 1.3.0 needs no reconfiguration: your shop stays connected to the same Fetch store, with the same webhook and cron URL.
+
 ## Settings
+
+With multistore, every setting below except the cron URL is set per shop (see [Multistore](#multistore)).
 
 | Setting | What it does |
 |---|---|
 | Server | **Production** (`https://api.fetch.com.cy`) is the default. Live keys, and sandbox keys Fetch issues for testing, both use Production; your key decides whether you see test data. **Staging** (`https://api-stg.fetch.com.cy`) is only for keys Fetch has moved to staging. **Custom URL** only if Fetch gives you a different address. Changing the server clears the stored token, store and webhook secret. |
 | Custom URL | Used only with **Custom URL**. A trailing slash is removed. |
 | Client ID / Client secret | Your Partner API key. The secret is stored in your PrestaShop database and is never shown again after saving; leave the field blank to keep it. |
-| Fetch store | The Fetch store your products and orders belong to. Filled in by **Connect & load stores**. |
+| Fetch store | The Fetch store your products and orders belong to. Filled in by **Connect & load stores**. With multistore, a Fetch store can belong to one shop only; a store another shop uses is marked in the list and cannot be saved. |
 | Sync to Fetch | Turns automatic product, price and stock sync on or off. |
 | Price markup (%) | Added to every price and sale price sent to Fetch, for example `10` sends a €10.00 product as €11.00. Your PrestaShop prices are not changed. Accepts 0 to 100 with up to two decimals (`12,5` and `15 %` are accepted). The VAT-inclusive price is rounded to the cent first, then the markup is added and rounded half up (9.99 at 15% is 11.49). Stock is never affected. Changing the markup resends all products to Fetch. Imported Fetch orders keep the prices the customer paid on Fetch. |
 | Catalogue mode | **Add and update only** (the default) sends this shop's products and never touches the other products in your Fetch store. **Mirror this shop 1:1** also switches off, at the end of every full sync, the products in your Fetch store that this shop does not sell. See [Mirror this shop 1:1](#mirror-this-shop-11). **Preview** shows what it would switch off, without changing anything. |
@@ -68,7 +77,7 @@ Do not delete the carrier or the product; the module uses them to build Fetch or
 | Auto-accept | Accepts new Fetch orders automatically, using the preparation time below. |
 | Preparation time | Minutes you need to prepare an order (0–180). The courier is booked to collect after this. |
 | Instant order alerts | Shows your webhook URL. **Register webhook** registers it with Fetch and stores the signing secret. Press it again to issue a new secret. |
-| Cron URL | The URL your server's cron should call. The token in it is generated at install time. |
+| Cron URL | The URL your server's cron should call. The token in it is generated at install time. One URL serves every shop. |
 
 ## How products are synced
 
@@ -218,6 +227,7 @@ X-Fetch-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>" with
 ```
 
 The module rejects requests with a wrong signature or a timestamp more than 5 minutes off (`401`).
+With multistore, each delivery is handled by the shop connected to the delivery's Fetch store, and must be signed with that shop's secret; see [Multistore](#multistore).
 Fetch retries failed deliveries with the same `eventId`, and the module processes each event once.
 The endpoint works in maintenance mode too.
 
@@ -227,15 +237,68 @@ If you cannot use webhooks (for example a shop without HTTPS), the 2-minute chec
 
 The cron URL (`/module/fetchsync/cron?token=…`) sends queued product changes, catches sales that start or end, and checks Fetch for orders.
 Call it every 1–2 minutes.
+With multistore, one call does this for every connected shop, one shop after another; a shop whose key fails or whose Fetch store is unreachable is logged and skipped, and the others carry on.
 
 Without a cron job, the module does the same work at most every 2 minutes at the end of an ordinary page view of your shop or back office.
 On a quiet shop that can delay orders, so set up the cron job.
 
 ## Multistore
 
-The module works with your **default shop**: its products, prices, stock, language and currency, and one Fetch store.
-Settings are shared by all shops.
-Other shops of a multistore installation are not synced.
+Each shop of a multistore installation can be connected to its own Fetch store, independently.
+A shop that is not connected is left alone.
+Without multistore nothing changes: the module works with your shop exactly as before.
+
+### Settings per shop
+
+Choose a shop in the **shop selector** at the top of the back office, then open **Configure** on the Fetch module.
+The page shows that shop's settings: its key (client ID and secret), server, Fetch store, sync on or off, price markup, catalogue mode, order import, auto-accept, preparation time and webhook.
+They are stored as that shop's own PrestaShop configuration values; a shop never inherits another shop's Fetch store.
+
+In **All shops** (or a shop group) the page shows an overview instead: every shop with its Fetch store, whether it syncs, its last product sync, the changes waiting, its last Fetch order and its status.
+Press **Edit** on a row to switch to that shop.
+
+Several shops can use one Partner key that covers several Fetch stores.
+Each shop still chooses its own Fetch store, and two shops cannot choose the same one: **Connect & load stores** picks a store no other shop uses, and saving a store another shop already has is refused.
+
+### Products
+
+A product change is queued for every connected shop that sells the product (Catalog → product → shop association), and each shop's Fetch store receives that shop's own:
+
+- price, sale and specific prices, VAT included, in the shop's default currency and country;
+- stock, or the shop group's stock when the group shares stock;
+- active and visibility state;
+- name and texts in the shop's default language;
+- price markup.
+
+**Sync all products now**, mirror mode and the queue work per shop: mirror mode on one shop only switches off products in that shop's Fetch store.
+References may repeat across shops; a reference is matched within each Fetch store.
+A product taken out of a shop is switched off in that shop's Fetch store.
+
+### Orders
+
+An order from Fetch store X is created in the shop connected to X: with that shop's id and group, its currency (the order's currency when the shop has it) and language, and a guest customer of that shop.
+Accept, ready and reject on the order page use the key of the order's shop.
+
+The **Fetch delivery** carrier and the **Fetch item** placeholder product are associated with every shop.
+A shop created later gets them when it is created with the module's data ("Import data" → Fetch), or otherwise the first time its Fetch settings are saved or it receives a Fetch order.
+
+### Webhooks
+
+Every shop has a webhook URL on its own domain, and **Register webhook** registers it with the shop's key.
+Each delivery goes to the shop connected to the delivery's Fetch store, whichever shop domain it arrives on, and must be signed with that shop's secret.
+This works whether your shops have separate domains or share one.
+
+A Partner key has one webhook at Fetch.
+When shops share a key, registering the webhook in one of them replaces the key's URL and secret for all of them; the module gives the new secret to every shop using that key, and orders still reach the right shop by their Fetch store.
+
+### Cron
+
+The one cron URL processes every connected shop (see [Cron and background work](#cron-and-background-work)).
+
+### Turning multistore on later
+
+When you turn multistore on, the settings you already have belong to your default shop, which stays connected.
+New shops start unconfigured.
 
 ## Troubleshooting
 
@@ -249,6 +312,8 @@ Other shops of a multistore installation are not synced.
 | Webhook returns 401 | Press **Register webhook** again to refresh the signing secret, and check the server clock. |
 | An order line shows "not in your catalogue" | The Fetch item's reference matches no product or combination reference. Its stock was not reduced. |
 | Changes wait in the queue | Fetch was unreachable or rate-limited the shop; the next cron run retries. |
+| Multistore: a shop cannot save its Fetch store | Another shop is already connected to that Fetch store. Each shop needs its own store; ask Fetch to add one to your key. |
+| Multistore: webhooks return 401 for one shop | Another shop with the same key registered the webhook since. Press **Register webhook** in the shop that fails; every shop on that key gets the new secret. |
 | "Mirror held" in Recent activity | The run would have switched off more than half of your active Fetch products. Press **Preview** to check the list, then **Apply anyway** in the notice at the top of the module page. |
 | "Mirror skipped" in Recent activity | Fetch could not be reached during the full sync or while reading your Fetch products, so nothing was switched off. Run **Sync all products now** again. |
 
@@ -268,10 +333,12 @@ Other shops of a multistore installation are not synced.
 php tests/unit.php
 
 # Build the module ZIP (fetchsync/ at the zip root)
-./build.sh            # → dist/fetchsync-1.2.0.zip
+./build.sh            # → dist/fetchsync-1.3.0.zip
 
 # End-to-end: PrestaShop 8.1 + MariaDB in Docker, the release ZIP, and a mock Fetch API
 node tests/e2e/run.mjs
+node tests/e2e/multistore.mjs   # three shops, three Fetch stores
+node tests/e2e/upgrade.mjs      # 1.2.0 → 1.3.0
 ```
 
 See [tests/README.md](tests/README.md) for details, and [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
