@@ -4,8 +4,10 @@
  * Covers webhook signature verification, the order mapping rules, the price
  * markup maths, the product text, specs and SEO mapping, the server setting,
  * request batching and the mirror mode's scan / plan / guard / switch-off
- * logic against a fake Partner API. The webhook, status, markup and mirror
- * cases are the same as the WooCommerce plugin's.
+ * logic against a fake Partner API, and multistore: per-shop settings, the
+ * default shop's legacy settings, store ownership and webhook routing. The
+ * webhook, status, markup and mirror cases are the same as the WooCommerce
+ * plugin's.
  */
 define('_PS_VERSION_', '8.1.0');
 define('_DB_PREFIX_', 'ps_');
@@ -60,10 +62,16 @@ class PrestaShopLogger
     }
 }
 
-/** Just enough of PrestaShop's Configuration for FetchSyncSettings. */
+/**
+ * Just enough of PrestaShop's Configuration for FetchSyncSettings: global
+ * values in $values, shop values in $shopValues, and PrestaShop's look-up
+ * order (shop, then group, then global; global only without multistore).
+ */
 class Configuration
 {
     public static $values = array();
+    public static $shopValues = array(); // id_shop → key → value
+    public static $groupValues = array(); // id_shop_group → key → value
 
     public static function getGlobalValue($key)
     {
@@ -77,16 +85,107 @@ class Configuration
         return true;
     }
 
-    public static function get($key)
+    public static function get($key, $idLang = null, $idShopGroup = null, $idShop = null)
     {
+        if (Shop::isFeatureActive() && $idShop && isset(self::$shopValues[$idShop]) && array_key_exists($key, self::$shopValues[$idShop])) {
+            return self::$shopValues[$idShop][$key];
+        }
+        if (Shop::isFeatureActive() && $idShopGroup && isset(self::$groupValues[$idShopGroup]) && array_key_exists($key, self::$groupValues[$idShopGroup])) {
+            return self::$groupValues[$idShopGroup][$key];
+        }
+
         return self::getGlobalValue($key);
+    }
+
+    public static function hasKey($key, $idLang = null, $idShopGroup = null, $idShop = null)
+    {
+        if ($idShop) {
+            return isset(self::$shopValues[$idShop]) && array_key_exists($key, self::$shopValues[$idShop]);
+        }
+
+        return array_key_exists($key, self::$values);
+    }
+
+    public static function updateValue($key, $value, $html = false, $idShopGroup = null, $idShop = null)
+    {
+        if (!Shop::isFeatureActive() || !$idShop) {
+            return self::updateGlobalValue($key, $value);
+        }
+        // Like PrestaShop 1.7: nothing is written when the value equals the one the shop already sees.
+        if ((string) self::get($key, null, $idShopGroup, $idShop) === (string) $value) {
+            return true;
+        }
+        self::$shopValues[$idShop][$key] = $value;
+
+        return true;
     }
 
     public static function deleteByName($key)
     {
         unset(self::$values[$key]);
+        foreach (self::$shopValues as $idShop => $values) {
+            unset(self::$shopValues[$idShop][$key]);
+        }
 
         return true;
+    }
+
+    /** Writes a row as given (the module adds a shop row PrestaShop 1.7's updateValue() would skip). */
+    public $name;
+    public $value;
+    public $id_shop_group;
+    public $id_shop;
+
+    public function add()
+    {
+        if ($this->id_shop) {
+            self::$shopValues[$this->id_shop][$this->name] = $this->value;
+        } else {
+            self::$values[$this->name] = $this->value;
+        }
+
+        return true;
+    }
+
+    public static function set($key, $value, $idShopGroup = null, $idShop = null)
+    {
+        if ($idShop) {
+            self::$shopValues[$idShop][$key] = $value;
+        }
+    }
+
+    public static function reset()
+    {
+        self::$values = array();
+        self::$shopValues = array();
+        self::$groupValues = array();
+    }
+}
+
+/** Shops 1 and 2 in group 1, shop 3 in group 2; multistore off unless $active. */
+class Shop
+{
+    public static $active = false;
+    public static $shops = array(1 => 1, 2 => 1, 3 => 2);
+
+    public static function isFeatureActive()
+    {
+        return self::$active;
+    }
+
+    public static function getShops($active = true, $idShopGroup = null, $asIds = false)
+    {
+        $out = array();
+        foreach (self::$shops as $id => $group) {
+            $out[$id] = $asIds ? $id : array('id_shop' => $id, 'name' => 'Shop ' . $id, 'id_shop_group' => $group);
+        }
+
+        return $out;
+    }
+
+    public static function getGroupFromShop($idShop, $asId = true)
+    {
+        return isset(self::$shops[$idShop]) ? self::$shops[$idShop] : false;
     }
 }
 
@@ -592,7 +691,127 @@ $api->pageSize = 500;
 $api->failBatches = true;
 $run = FetchSyncMirror::run(false, $api, $keepBig);
 check('a failed batch request stops the run; nothing counted as switched off', array(count($api->batches), $run['switched_off'], $run['errors']), array(1, 0, 450));
-Configuration::$values = array();
+Configuration::reset();
+
+// --- Multistore: per-shop settings --------------------------------------------------------
+
+/** A shop's own settings, written as if that shop's page were saved. */
+function shopSave($idShop, array $values)
+{
+    FetchSyncSettings::withShop($idShop, function () use ($values) {
+        FetchSyncSettings::update($values);
+    });
+}
+
+function shopGet($idShop, $name)
+{
+    return FetchSyncSettings::getFor($idShop, $name);
+}
+
+// Without multistore: one global set of values, as in 1.2.0, whatever shop is asked.
+Configuration::reset();
+Shop::$active = false;
+Configuration::$values['PS_SHOP_DEFAULT'] = '1';
+check('single shop: one shop', FetchSyncSettings::shopIds(), array(1));
+shopSave(1, array('client_id' => 'c1', 'client_secret' => 's1', 'store_id' => 'store-1', 'price_markup' => '5'));
+check('single shop: settings are stored globally, like 1.2.0', array(Configuration::$values['FETCHSYNC_CLIENT_ID'], Configuration::$shopValues), array('c1', array()));
+check('single shop: connected', FetchSyncSettings::connectedShopIds(), array(1));
+check('single shop: the default scope is the default shop', array(FetchSyncSettings::shopId(), FetchSyncSettings::get('store_id'), FetchSyncSettings::markup()), array(1, 'store-1', 5.0));
+check('the scope is restored after withShop()', array(FetchSyncSettings::withShop(2, function ($id) {
+    return FetchSyncSettings::scoped();
+}), FetchSyncSettings::scoped()), array(2, 0));
+
+// Multistore turned on: the global values are the default shop's until adopted; other shops start empty.
+Shop::$active = true;
+Configuration::$values['FETCHSYNC_CRON_TOKEN'] = 'tok';
+Configuration::$values['FETCHSYNC_PLACEHOLDER_ID'] = '99';
+check('multistore: every shop', FetchSyncSettings::shopIds(), array(1, 2, 3));
+check('multistore: the default shop still reads the 1.2.0 global values', array(shopGet(1, 'store_id'), shopGet(1, 'price_markup')), array('store-1', '5'));
+check('multistore: another shop does not inherit them', array(shopGet(2, 'store_id'), shopGet(2, 'client_id'), shopGet(3, 'price_markup')), array('', '', '0'));
+check('multistore: only the default shop is connected', FetchSyncSettings::connectedShopIds(), array(1));
+check('shared keys stay global: cron token and placeholder', array(shopGet(2, 'cron_token'), FetchSyncSettings::withShop(3, function () {
+    return FetchSyncSettings::internal('PLACEHOLDER_ID');
+})), array('tok', '99'));
+check('global keys', array(FetchSyncSettings::isGlobalKey('FETCHSYNC_CRON_TOKEN'), FetchSyncSettings::isGlobalKey('FETCHSYNC_OS_AWAITING'), FetchSyncSettings::isGlobalKey('FETCHSYNC_STORE_ID'), FetchSyncSettings::isGlobalKey('FETCHSYNC_TOKEN'), FetchSyncSettings::isGlobalKey('FETCHSYNC_MIRROR_PENDING')), array(true, true, false, false, false));
+
+check('adopt: copies the default shop\'s values into its own rows once', FetchSyncSettings::adoptLegacy(), true);
+check('adopt: shop rows written for the default shop only', array(Configuration::$shopValues[1]['FETCHSYNC_STORE_ID'], Configuration::$shopValues[1]['FETCHSYNC_PRICE_MARKUP'], isset(Configuration::$shopValues[2]), isset(Configuration::$shopValues[1]['FETCHSYNC_CRON_TOKEN'])), array('store-1', '5', false, false));
+check('adopt: global rows kept (turning multistore off finds them)', Configuration::$values['FETCHSYNC_STORE_ID'], 'store-1');
+check('adopt: runs once', FetchSyncSettings::adoptLegacy(), false);
+Configuration::$values['PS_SHOP_DEFAULT'] = '2';
+check('after adoption, a new default shop does not take over the old global values', array(shopGet(2, 'store_id'), shopGet(1, 'store_id')), array('', 'store-1'));
+Configuration::$values['PS_SHOP_DEFAULT'] = '1';
+
+shopSave(2, array('environment' => 'custom', 'custom_base_url' => 'https://mock.example', 'client_id' => 'c2', 'client_secret' => 's2', 'store_id' => 'store-2', 'price_markup' => '10', 'catalogue_mode' => 'mirror'));
+shopSave(3, array('environment' => 'custom', 'custom_base_url' => 'https://mock.example', 'client_id' => 'c2', 'client_secret' => 's2', 'store_id' => 'store-3', 'import_orders' => 'no'));
+check('per shop: each shop has its own store, markup and mode', array(shopGet(1, 'store_id'), shopGet(2, 'store_id'), shopGet(3, 'store_id'), shopGet(1, 'price_markup'), shopGet(2, 'price_markup'), shopGet(2, 'catalogue_mode'), shopGet(3, 'catalogue_mode')), array('store-1', 'store-2', 'store-3', '5', '10', 'mirror', 'add_update'));
+check('per shop: a group-level value is not inherited', (function () {
+    Configuration::$groupValues[2]['FETCHSYNC_AUTO_ACCEPT'] = 'yes';
+    $value = shopGet(3, 'auto_accept');
+    unset(Configuration::$groupValues[2]);
+
+    return $value;
+})(), 'no');
+check('per shop: markup and mirror follow the scope', array(FetchSyncSettings::withShop(2, function () {
+    return array(FetchSyncSettings::markup(), FetchSyncSettings::mirrorMode(), FetchSyncSettings::baseUrl());
+}), FetchSyncSettings::withShop(1, function () {
+    return array(FetchSyncSettings::markup(), FetchSyncSettings::mirrorMode());
+})), array(array(10.0, true, 'https://mock.example'), array(5.0, false)));
+check('per shop: internal state (token, back-off, mirror hold) is per shop', (function () {
+    FetchSyncSettings::withShop(2, function () {
+        FetchSyncSettings::setInternal('BACKOFF_UNTIL', time() + 60);
+    });
+
+    return array(FetchSyncSettings::withShop(2, function () {
+        return FetchSyncApi::backoffRemaining() > 0;
+    }), FetchSyncSettings::withShop(3, function () {
+        return FetchSyncApi::backoffRemaining();
+    }));
+})(), array(true, 0));
+check('connected shops', FetchSyncSettings::connectedShopIds(), array(1, 2, 3));
+check('shops for a store', array(FetchSyncSettings::shopsForStore('store-2'), FetchSyncSettings::shopsForStore('store-9'), FetchSyncSettings::shopsForStore('')), array(array(2), array(), array()));
+check('store owner: another shop on the same server', FetchSyncSettings::storeOwner('store-2', 'https://mock.example/', 3), 2);
+check('store owner: the shop itself is not an owner', FetchSyncSettings::storeOwner('store-2', 'https://mock.example', 2), 0);
+check('store owner: the same id on another server is another store', FetchSyncSettings::storeOwner('store-2', 'https://api.fetch.com.cy', 3), 0);
+check('store owner: a free store', FetchSyncSettings::storeOwner('store-9', 'https://mock.example', 3), 0);
+
+// --- Multistore: webhook routing --------------------------------------------------------------
+shopSave(1, array('webhook_secret' => 'sec-a'));
+shopSave(2, array('webhook_secret' => 'sec-b'));
+shopSave(3, array('webhook_secret' => 'sec-c'));
+$delivery = function ($storeId) {
+    return json_encode(array('event' => 'order.created', 'eventId' => 'evt-' . $storeId, 'data' => array('orderId' => 'o-' . $storeId, 'storeId' => $storeId, 'status' => 'DRAFT')));
+};
+$signed = function ($body, $secret) {
+    $t = time();
+
+    return 't=' . $t . ',v1=' . hash_hmac('sha256', $t . '.' . $body, $secret);
+};
+check('route: by the delivery\'s storeId', array(FetchSyncWebhook::shopFor(json_decode($delivery('store-1'), true)), FetchSyncWebhook::shopFor(json_decode($delivery('store-3'), true))), array(1, 3));
+check('route: unknown store → none', FetchSyncWebhook::shopFor(json_decode($delivery('store-9'), true)), 0);
+check('route: no storeId with several connected shops → none', FetchSyncWebhook::shopFor(array('data' => array('orderId' => 'x'))), 0);
+check('verify: store-2 signed with shop A\'s secret → 401', FetchSyncWebhook::handle($delivery('store-2'), $signed($delivery('store-2'), 'sec-a'))[0], 401);
+check('verify: store-2 signed with shop C\'s secret → 401', FetchSyncWebhook::handle($delivery('store-2'), $signed($delivery('store-2'), 'sec-c'))[0], 401);
+check('verify: unknown store, signed by one of the shops → 200, ignored', FetchSyncWebhook::handle($delivery('store-9'), $signed($delivery('store-9'), 'sec-b')), array(200, array('ok' => true, 'ignored' => 'store not connected')));
+check('verify: unknown store, bad signature → 401', FetchSyncWebhook::handle($delivery('store-9'), $signed($delivery('store-9'), 'nope'))[0], 401);
+check('verify: a shop without a secret refuses everything', (function () use ($delivery, $signed) {
+    shopSave(3, array('webhook_secret' => ''));
+    $code = FetchSyncWebhook::handle($delivery('store-3'), $signed($delivery('store-3'), ''))[0];
+    shopSave(3, array('webhook_secret' => 'sec-c'));
+
+    return $code;
+})(), 401);
+check('shared key: registering on shop 3 gives shop 2 (same key and server) the new secret, not shop 1', array(FetchSyncWebhook::shareSecret(3, 'sec-new', 123), shopGet(2, 'webhook_secret'), shopGet(2, 'webhook_registered'), shopGet(1, 'webhook_secret')), array(array(2), 'sec-new', '123', 'sec-a'));
+
+// --- Multistore: a single shop routes like 1.2.0 ------------------------------------------------
+Configuration::reset();
+Shop::$active = false;
+Configuration::$values['PS_SHOP_DEFAULT'] = '1';
+FetchSyncSettings::update(array('client_id' => 'c', 'client_secret' => 's', 'store_id' => 'store-1', 'webhook_secret' => 'whsec_test'));
+check('single shop: a delivery without storeId goes to the shop', FetchSyncWebhook::shopFor(array('data' => array('orderId' => 'x'))), 1);
+check('single shop: another store on the same key is acknowledged, not imported', FetchSyncWebhook::handle($delivery('store-7'), $signed($delivery('store-7'), 'whsec_test')), array(200, array('ok' => true, 'ignored' => 'store not connected')));
+check('single shop: wrong secret → 401', FetchSyncWebhook::handle($delivery('store-1'), $signed($delivery('store-1'), 'other'))[0], 401);
+Configuration::reset();
 
 echo "$passes passed, $failures failed\n";
 exit($failures ? 1 : 0);
