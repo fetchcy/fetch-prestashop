@@ -86,9 +86,10 @@ class FetchSyncProductMapper
 
     /**
      * Fetch items for one product, each paired with the [id_product,
-     * id_product_attribute] its result is recorded on.
+     * id_product_attribute] its result is recorded on and whether it is a
+     * backorder item that "Exclude backorder items" keeps off Fetch.
      *
-     * @return array<int,array{0:array<string,mixed>,1:array{0:int,1:int}}>
+     * @return array<int,array{0:array<string,mixed>,1:array{0:int,1:int},2:bool}>
      */
     public static function toFetchItems(Product $product, $forceInactive = false)
     {
@@ -123,7 +124,7 @@ class FetchSyncProductMapper
                 $item['images'] = $images;
             }
 
-            return array(array($item, array($id, 0)));
+            return array(array($item, array($id, 0), self::backorder($id, 0)));
         }
 
         $out = array();
@@ -147,7 +148,7 @@ class FetchSyncProductMapper
             if ($images) {
                 $item['images'] = $images;
             }
-            $out[] = array($item, array($id, $ipa));
+            $out[] = array($item, array($id, $ipa), self::backorder($id, $ipa));
         }
 
         return $out;
@@ -155,7 +156,8 @@ class FetchSyncProductMapper
 
     /**
      * The refs this product keeps on sale on Fetch, without building the full
-     * items: none when it is not a type we sync or is inactive in the shop.
+     * items: none when it is not a type we sync or is inactive in the shop;
+     * backorder items that were never sent are left out too.
      *
      * @return string[]
      */
@@ -165,7 +167,17 @@ class FetchSyncProductMapper
             return array();
         }
 
-        return array_values(self::itemRefs($product, self::combinations($product, FetchSyncSettings::defaultLangId())));
+        $id = (int) $product->id;
+        $out = array();
+        foreach (self::itemRefs($product, self::combinations($product, FetchSyncSettings::defaultLangId())) as $ipa => $ref) {
+            // Not sold on Fetch (and never created there), so mirror mode switches it off.
+            if (self::backorder($id, $ipa) && !self::wasSynced($id, $ipa)) {
+                continue;
+            }
+            $out[] = $ref;
+        }
+
+        return $out;
     }
 
     /**
@@ -435,8 +447,8 @@ class FetchSyncProductMapper
     }
 
     /**
-     * With stock management on: the available quantity (never negative), the
-     * shop's own or its group's when the group shares stock.
+     * With stock management on: the available quantity (never negative; 0 for
+     * a backorder item), the shop's own or its group's when the group shares stock.
      * With it off: omitted, so Fetch sells the product without a stock limit.
      */
     private static function stock($idProduct, $idProductAttribute)
@@ -445,7 +457,51 @@ class FetchSyncProductMapper
             return null;
         }
 
-        return max(0, (int) StockAvailable::getQuantityAvailableByProduct((int) $idProduct, (int) $idProductAttribute, self::dataShop()));
+        if (self::backorder($idProduct, $idProductAttribute)) {
+            return 0;
+        }
+
+        return max(0, self::quantity($idProduct, $idProductAttribute));
+    }
+
+    private static function quantity($idProduct, $idProductAttribute)
+    {
+        return (int) StockAvailable::getQuantityAvailableByProduct((int) $idProduct, (int) $idProductAttribute, self::dataShop());
+    }
+
+    /**
+     * True when this shop has "Exclude backorder items" on and PrestaShop would
+     * sell the product or combination with no stock left: stock management on,
+     * quantity 0 or less, and out-of-stock orders allowed (the product's own
+     * setting, or the shop's default). Read in the shop's own context, so a
+     * shop group that shares stock shares the product's setting too.
+     */
+    public static function backorder($idProduct, $idProductAttribute)
+    {
+        if ('yes' !== FetchSyncSettings::get('exclude_backorders') || !FetchSyncSettings::shopConfig('PS_STOCK_MANAGEMENT')) {
+            return false;
+        }
+        $quantity = self::quantity($idProduct, $idProductAttribute);
+        if ($quantity > 0) {
+            return false;
+        }
+
+        return self::allowsBackorder(
+            StockAvailable::outOfStock((int) $idProduct, self::dataShop()),
+            (bool) FetchSyncSettings::shopConfig('PS_ORDER_OUT_OF_STOCK')
+        );
+    }
+
+    /**
+     * PrestaShop's rule (Product::isAvailableWhenOutOfStock): 1 allows orders,
+     * 0 refuses them, 2 (default) follows the shop's
+     * "Allow ordering of out-of-stock products".
+     */
+    public static function allowsBackorder($outOfStock, $shopAllows)
+    {
+        $outOfStock = (int) $outOfStock;
+
+        return 2 === $outOfStock ? (bool) $shopAllows : (bool) $outOfStock;
     }
 
     /** Description, summary, brand, category, tags, specs and SEO, shared by a product's combinations. */

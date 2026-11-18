@@ -244,6 +244,37 @@ try {
   st = await step('ms_state');
   ok('once B\'s key works again, its queue is sent', st.pending.B === 0 && putsTo(since(m0), 'store-2').length > 0, { pending: st.pending });
 
+  // --- Exclude backorder items, per shop ---------------------------------------------------------------
+  // BO-MS has no stock anywhere: shop A allows out-of-stock orders on the product, shop B follows its
+  // shop setting (refuses), shop C follows its setting (allows).
+  m0 = mark();
+  const bo = await step('bo_ms_create');
+  ok('backorder: the product is sold in all three shops', bo.in_shop.A && bo.in_shop.B && bo.in_shop.C, bo.in_shop);
+  c = await cron();
+  reqs = since(m0);
+  let rowsBo = await step('bo_ms_rows');
+  ok('backorder: only shop B (which refuses out-of-stock orders) creates it, with stock 0', lastItem(reqs, 'store-2', 'BO-MS')?.stockCount === 0 && !lastItem(reqs, 'store-1', 'BO-MS') && !lastItem(reqs, 'store-3', 'BO-MS') && rowsBo.rows.length === 1 && Number(rowsBo.rows[0].id_shop) === bo.shops.B, { rows: rowsBo.rows, a: lastItem(reqs, 'store-1', 'BO-MS'), c: lastItem(reqs, 'store-3', 'BO-MS') });
+  ok('…and the other stores have no such listing', !(await listings('store-1')).some((l) => l.ref === 'BO-MS') && !(await listings('store-3')).some((l) => l.ref === 'BO-MS') && (await listings('store-2')).some((l) => l.ref === 'BO-MS'));
+  m0 = mark();
+  await step('bo_ms_stock', { shop: 'A', qty: 4 });
+  c = await cron();
+  reqs = since(m0);
+  ok('backorder: stock returning in shop A creates it on store-1 with 4; the others are untouched', lastItem(reqs, 'store-1', 'BO-MS')?.stockCount === 4 && !lastItem(reqs, 'store-3', 'BO-MS') && (await listings('store-1')).some((l) => l.ref === 'BO-MS'), { a: lastItem(reqs, 'store-1', 'BO-MS') });
+  m0 = mark();
+  await step('bo_ms_stock', { shop: 'A', qty: 0 });
+  c = await cron();
+  reqs = since(m0);
+  ok('…and when A runs out again the linked listing is updated to stock 0', lastItem(reqs, 'store-1', 'BO-MS')?.stockCount === 0 && lastItem(reqs, 'store-1', 'BO-MS')?.isActive === true, lastItem(reqs, 'store-1', 'BO-MS'));
+  m0 = mark();
+  await step('bo_ms_stock', { shop: 'C', qty: 6 });
+  c = await cron();
+  reqs = since(m0);
+  ok('backorder: shop C (shared stock group) creates it on store-3 once its group has stock', lastItem(reqs, 'store-3', 'BO-MS')?.stockCount === 6 && lastItem(reqs, 'store-3', 'BO-MS')?.price === '11.00', lastItem(reqs, 'store-3', 'BO-MS'));
+  s = await save('B', { submitFetchsyncSave: '1', fetchsync_exclude_backorders: '0' });
+  ok('the setting is per shop: switching it off on B leaves A and C on', s.settings.exclude_backorders === 'no' && (await step('ms_state')).settings.A.exclude_backorders === 'yes' && (await step('ms_state')).settings.C.exclude_backorders === 'yes', s.settings);
+  c = await cron();
+  ok('every request passed the mock\'s live rules after the backorder tests', mockLog().problems.length === 0, mockLog().problems);
+
   // --- Overview -------------------------------------------------------------------------------------------
   const ov = await step('ms_overview');
   const rowOf = (id) => ov.rows[id] || [];

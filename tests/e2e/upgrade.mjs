@@ -1,9 +1,10 @@
-// e2e upgrade: install 1.2.0 (git tag v1.2.0), connect and use it, put this tree's files
+// e2e upgrade: install an older release (git tag v1.3.0 by default), connect and use it, put this tree's files
 // in place, run PrestaShop's module upgrade, and check the shop is still connected and
-// syncing with nothing reconfigured. Then turn multistore on and add a shop.
+// syncing with nothing reconfigured, and that "Exclude backorder items" is on. Then turn
+// multistore on and add a shop.
 //
 //   node tests/e2e/upgrade.mjs          (PS_IMAGE, PS_PORT, MOCK_PORT, COMPOSE_PROJECT_NAME, E2E_KEEP,
-//                                        FROM_REF=v1.2.0)
+//                                        FROM_REF=v1.3.0; v1.2.0 also works)
 import { spawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -18,7 +19,7 @@ const MOCK_PORT = Number(process.env.MOCK_PORT || 9099);
 const MOCK = `http://127.0.0.1:${MOCK_PORT}`;
 const KEEP = !!process.env.E2E_KEEP;
 const PROJECT = process.env.COMPOSE_PROJECT_NAME || 'fetchsync-e2e';
-const FROM_REF = process.env.FROM_REF || 'v1.2.0';
+const FROM_REF = process.env.FROM_REF || 'v1.3.0';
 const results = [];
 const ok = (label, cond, extra) => {
   results.push([cond ? 'PASS' : 'FAIL', label]);
@@ -41,6 +42,7 @@ fs.mkdirSync(work, { recursive: true });
 execFileSync('sh', ['-c', `git -C "${repo}" archive "${FROM_REF}" fetchsync | tar -x -C "${work}"`]);
 const oldVersion = fs.readFileSync(path.join(mounted, 'config.xml'), 'utf8').match(/<version><!\[CDATA\[([^\]]+)\]\]>/)[1];
 const zip = execFileSync(path.join(repo, 'build.sh'), { cwd: repo }).toString().trim();
+const NEW = zip.match(/fetchsync-([0-9.]+)\.zip/)[1];
 fs.mkdirSync(fresh, { recursive: true });
 execFileSync('unzip', ['-q', path.join(repo, zip), '-d', fresh]);
 composeEnv.MODULE_DIR = mounted;
@@ -117,7 +119,7 @@ try {
   execFileSync('rsync', ['-a', '--delete', `${path.join(fresh, 'fetchsync')}/`, `${mounted}/`]);
   await sleep(3000); // opcache revalidation
   const up1 = await step('upgrade');
-  ok(`upgrade ${oldVersion} → 1.3.0 runs upgrade-1.3.0.php and succeeds`, up1.from === oldVersion && up1.needed === true && up1.success === true && up1.upgraded_to === '1.3.0' && up1.version === '1.3.0' && up1.active === true, up1);
+  ok(`upgrade ${oldVersion} → ${NEW} succeeds`, up1.from === oldVersion && up1.needed === true && up1.success === true && up1.upgraded_to === NEW && up1.version === NEW && up1.active === true, up1);
   const schema = await step('schema');
   ok('the sync, queue, order and log tables have id_shop, in the new keys', Object.values(schema.id_shop).every(Boolean) && schema.keys.fetchsync_queue.join() === 'id_shop,id_product' && schema.keys.fetchsync_product.join() === 'id_shop,id_product,id_product_attribute' && schema.keys.fetchsync_deactivation.join() === 'id_shop,ref', schema.keys);
   ok('existing sync and order rows belong to the default shop', schema.product_rows.length > 0 && schema.product_rows.every((r) => Number(r.id_shop) === 1) && schema.order_rows.length === 1 && Number(schema.order_rows[0].id_shop) === 1, { products: schema.product_rows.slice(0, 3), orders: schema.order_rows });
@@ -126,19 +128,27 @@ try {
   const same = (k) => JSON.stringify(after.settings[k]) === JSON.stringify(before.settings[k]);
   ok('every setting is kept: connection, store, options, webhook date and cron token', ['environment', 'custom_base_url', 'client_id', 'store_id', 'store_name', 'sync_products', 'import_orders', 'auto_accept', 'prep_minutes', 'price_markup', 'catalogue_mode', 'webhook_registered', 'cron_token'].every(same), { before: before.settings, after: after.settings });
 
+  ok('1.3.1 explicitly turns "Exclude backorder items" on (it was not stored before), and nothing else changed', before.exclude_rows.length === 0 && after.settings.exclude_backorders === 'yes' && after.exclude_rows.length >= 1 && after.exclude_rows.every((r) => r.value === 'yes'), { before: before.exclude_rows, after: after.exclude_rows });
+
   // --- Still connected and syncing, with zero reconfiguration --------------------------------
   let m0 = mark();
   const stock = await step('change_stock');
   const last = puts(m0).at(-1)?.body.products.find((p) => p.ref === 'CBL-001');
-  ok('1.3.0: a stock change still reaches store-1', stock.sent === 1 && last?.stockCount === 6, { stock, last });
-  ok('1.3.0: User-Agent says 1.3.0', mockLog().requests.slice(m0).every((r) => (r.ua || '').startsWith('FetchForPrestaShop/1.3.0')));
+  ok(`${NEW}: a stock change still reaches store-1`, stock.sent === 1 && last?.stockCount === 6, { stock, last });
+  ok(`${NEW}: User-Agent says ${NEW}`, mockLog().requests.slice(m0).every((r) => (r.ua || '').startsWith(`FetchForPrestaShop/${NEW}`)));
   c = await cron();
   o = await step('order', { order: 'up-1' });
-  ok('1.3.0: the order imported before the upgrade is not imported again', c.status === 200 && c.body.orders_polled === true && o.count_by_transaction === 1, { c: c.body, count: o.count_by_transaction });
+  ok(`${NEW}: the order imported before the upgrade is not imported again`, c.status === 200 && c.body.orders_polled === true && o.count_by_transaction === 1, { c: c.body, count: o.count_by_transaction });
   const ev = JSON.stringify({ event: 'order.created', eventId: 'evt-up-2', sentAt: new Date().toISOString(), data: order('up-2', 'CBL-001') });
   const wr = await postWebhook(ev, sign(ev));
   o = await step('ms_order', { order: 'up-2' });
-  ok('1.3.0: a webhook signed with the old secret is accepted and lands in the default shop', wr.status === 200 && o.id_order > 0 && o.id_shop === 1 && Number(o.row?.id_shop) === 1, { status: wr.status, o });
+  ok(`${NEW}: a webhook signed with the old secret is accepted and lands in the default shop`, wr.status === 200 && o.id_order > 0 && o.id_shop === 1 && Number(o.row?.id_shop) === 1, { status: wr.status, o });
+
+  const boBefore = mark();
+  const boNew = await step('bo_create', { ref: 'BO-UP', qty: 0, oos: 1 });
+  ok('the upgraded shop does not create a product it would sell out of stock', boNew.rows.length === 0 && !puts(boBefore).some((r) => r.body.products.some((p) => p.ref === 'BO-UP')), boNew);
+  await step('bo_stock', { ref: 'BO-UP', qty: 2 });
+  ok('…and creates it when stock arrives', puts(boBefore).some((r) => r.body.products.some((p) => p.ref === 'BO-UP' && p.stockCount === 2)));
 
   // --- Multistore turned on afterwards ------------------------------------------------------
   const add = await step('ms_add_shop');

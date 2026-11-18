@@ -15,6 +15,10 @@
  * With multistore, every connected shop syncs to its own Fetch store: a
  * change is queued once per connected shop that sells the product, and each
  * shop's queue is sent with that shop's prices, stock, language and markup.
+ *
+ * With "Exclude backorder items" a product or combination PrestaShop would
+ * sell out of stock is sent with stock 0 and is never created on Fetch; one
+ * Fetch already has keeps being updated.
  */
 if (!defined('_PS_VERSION_')) {
     exit;
@@ -362,6 +366,10 @@ class FetchSyncProductSync
             }
             foreach ($pairs as $pair) {
                 list($item, $owner) = $pair;
+                // A backorder item is not created on Fetch; one already there keeps syncing (stock 0) so it can come back.
+                if (!empty($pair[2]) && !FetchSyncProductMapper::wasSynced($owner[0], $owner[1])) {
+                    continue;
+                }
                 $items[] = $item;
                 $owners[$item['ref']] = $owner;
             }

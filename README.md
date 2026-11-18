@@ -36,7 +36,7 @@ It uses the [Fetch Partner API](https://developer.fetch.com.cy) and works the sa
 
 1. Ask Fetch for a **Partner API key** for your store.
    You receive a **client ID** and a **client secret**.
-2. In the back office, go to **Modules → Module Manager → Upload a module** and upload `fetchsync-1.3.0.zip`.
+2. In the back office, go to **Modules → Module Manager → Upload a module** and upload `fetchsync-1.3.1.zip`.
    PrestaShop installs it.
 3. Press **Configure** on the **Fetch** module.
    With multistore, first choose the shop in the shop selector at the top of the back office (see [Multistore](#multistore)).
@@ -58,7 +58,8 @@ Do not delete the carrier or the product; the module uses them to build Fetch or
 ### Upgrading
 
 Upload the new ZIP the same way; PrestaShop runs the module's upgrade.
-Upgrading from 1.2.0 to 1.3.0 needs no reconfiguration: your shop stays connected to the same Fetch store, with the same webhook and cron URL.
+Upgrading from 1.2.0 or 1.3.0 needs no reconfiguration: your shop stays connected to the same Fetch store, with the same webhook and cron URL.
+Upgrading to 1.3.1 turns **Exclude backorder items** on and leaves every other setting as it was.
 
 ## Settings
 
@@ -72,6 +73,7 @@ With multistore, every setting below except the cron URL is set per shop (see [M
 | Fetch store | The Fetch store your products and orders belong to. Filled in by **Connect & load stores**. With multistore, a Fetch store can belong to one shop only; a store another shop uses is marked in the list and cannot be saved. |
 | Sync to Fetch | Turns automatic product, price and stock sync on or off. |
 | Price markup (%) | Added to every price and sale price sent to Fetch, for example `10` sends a €10.00 product as €11.00. Your PrestaShop prices are not changed. Accepts 0 to 100 with up to two decimals (`12,5` and `15 %` are accepted). The VAT-inclusive price is rounded to the cent first, then the markup is added and rounded half up (9.99 at 15% is 11.49). Stock is never affected. Changing the markup resends all products to Fetch. Imported Fetch orders keep the prices the customer paid on Fetch. |
+| Exclude backorder items | On by default, per shop. A product or combination that PrestaShop would sell when it is out of stock is not sold on Fetch: it is sent with stock 0, and is not added to Fetch as a new product. See [Backorder items](#backorder-items). Changing it resends all products. |
 | Catalogue mode | **Add and update only** (the default) sends this shop's products and never touches the other products in your Fetch store. **Mirror this shop 1:1** also switches off, at the end of every full sync, the products in your Fetch store that this shop does not sell. See [Mirror this shop 1:1](#mirror-this-shop-11). **Preview** shows what it would switch off, without changing anything. |
 | Import Fetch orders | Turns order import on or off. |
 | Auto-accept | Accepts new Fetch orders automatically, using the preparation time below. |
@@ -107,7 +109,7 @@ Fetch maintains the name, photos and category of shared catalogue products.
 | Features, in their position order | Specs (name and value; a feature with several values is one spec) |
 | SEO meta title and meta description | The shop's SEO title and description |
 | Price, specific prices (sales) | Price and sale price, **VAT included**, as an anonymous visitor in your shop's default country would pay, plus the price markup |
-| Quantity (stock management on) | Exact quantity (never below 0) |
+| Quantity (stock management on) | Exact quantity (never below 0; always 0 for a backorder item) |
 | Stock management off | Sold without a stock limit |
 | Enabled, visible somewhere, available for order, in the default shop | Active on Fetch |
 | Disabled, visibility "Nowhere", not available for order | Inactive on Fetch |
@@ -133,6 +135,21 @@ A combination only uses its own barcode, never the product's.
 - If Fetch cannot be reached, or answers `429 Too Many Requests`, the products stay queued and are retried later (after `Retry-After`, then 2, 4, 8 … minutes, at most hourly).
 - A sale that starts or ends on a date is picked up by the next cron run after that date.
 - The configuration page shows how many changes are waiting, and **Recent activity** shows each batch.
+
+### Backorder items
+
+With **Exclude backorder items** on (the default), nothing that PrestaShop would sell when it is out of stock is sold on Fetch.
+That is a product or combination with stock management on, a quantity of 0 or less, and out-of-stock orders allowed: either the product's own setting is **Allow orders**, or it is **Default** and the shop's **Allow ordering of out-of-stock products** is on.
+
+- It is sent to Fetch with stock 0, so Fetch shows it as out of stock.
+- It is not added to Fetch as a new product (or combination) while it is a backorder item.
+  The moment it has stock again, or the shop stops allowing out-of-stock orders, the normal sync creates it.
+- A product that is already on Fetch stays there and keeps being updated, so it drops to 0 and comes back when stock returns.
+- It applies to the full sync, to every single-product sync (stock changes from orders on your own site or from Fetch included), to combinations (each one on its own quantity), and, with multistore, to each shop with that shop's own stock and ordering settings.
+- With stock management off, nothing is excluded: those products are sold without a stock limit.
+- In mirror mode, a backorder item that was never sent counts as not sold, so it is switched off if it is already on Fetch.
+
+Turn the setting off to sell backorder items on Fetch like any other product.
 
 ### Mirror this shop 1:1
 
@@ -251,7 +268,7 @@ Without multistore nothing changes: the module works with your shop exactly as b
 ### Settings per shop
 
 Choose a shop in the **shop selector** at the top of the back office, then open **Configure** on the Fetch module.
-The page shows that shop's settings: its key (client ID and secret), server, Fetch store, sync on or off, price markup, catalogue mode, order import, auto-accept, preparation time and webhook.
+The page shows that shop's settings: its key (client ID and secret), server, Fetch store, sync on or off, price markup, catalogue mode, exclude backorder items, order import, auto-accept, preparation time and webhook.
 They are stored as that shop's own PrestaShop configuration values; a shop never inherits another shop's Fetch store.
 
 In **All shops** (or a shop group) the page shows an overview instead: every shop with its Fetch store, whether it syncs, its last product sync, the changes waiting, its last Fetch order and its status.
@@ -333,12 +350,12 @@ New shops start unconfigured.
 php tests/unit.php
 
 # Build the module ZIP (fetchsync/ at the zip root)
-./build.sh            # → dist/fetchsync-1.3.0.zip
+./build.sh            # → dist/fetchsync-1.3.1.zip
 
 # End-to-end: PrestaShop 8.1 + MariaDB in Docker, the release ZIP, and a mock Fetch API
 node tests/e2e/run.mjs
 node tests/e2e/multistore.mjs   # three shops, three Fetch stores
-node tests/e2e/upgrade.mjs      # 1.2.0 → 1.3.0
+node tests/e2e/upgrade.mjs      # 1.3.0 → 1.3.1
 ```
 
 See [tests/README.md](tests/README.md) for details, and [CHANGELOG.md](CHANGELOG.md) for what changed in each version.

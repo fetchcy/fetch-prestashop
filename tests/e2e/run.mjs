@@ -128,7 +128,7 @@ try {
   cronToken = new URL(cfg.cron_url).searchParams.get('token');
   let log = mockLog();
   ok('token request is client_credentials', log.requests.some((r) => r.path === '/api/v1/oauth/token' && r.body?.grant_type === 'client_credentials' && r.body?.client_id === 'client-1'));
-  ok('User-Agent identifies the module', log.requests.some((r) => /^FetchForPrestaShop\/1\.3\.0/.test(r.ua || '')), log.requests.at(-1)?.ua);
+  ok('User-Agent identifies the module', log.requests.some((r) => /^FetchForPrestaShop\/1\.3\.1/.test(r.ua || '')), log.requests.at(-1)?.ua);
 
   // --- Products ---------------------------------------------------------------
   const prod = await step('create_products');
@@ -308,6 +308,73 @@ try {
   const lamp = log.requests.filter((x) => x.method === 'PUT' && x.path.endsWith('/products')).flatMap((x) => x.body.products).filter((p) => p.ref === 'LAMP-TMP');
   ok('deleting a synced product switches it off on Fetch (full row, price included)', del.synced === true && del.deactivations_queued === 1 && del.deactivations_after === 0 && lamp.at(-1)?.isActive === false && lamp.at(-1)?.price === '22.00', { del, lamp: lamp.at(-1) });
   ok('all PUT payloads still pass mock validation', log.problems.length === 0, log.problems);
+
+  // --- Exclude backorder items ----------------------------------------------------------------
+  const boMark = () => mockLog().requests.length;
+  const boPuts = (n, ref) => mockLog().requests.slice(n).filter((r) => r.method === 'PUT' && r.path.endsWith('/products')).flatMap((r) => r.body.products).filter((p) => p.ref === ref);
+  const boListing = async (ref) => (await (await fetch(`${MOCK}/__listings`)).json()).data.find((l) => l.ref === ref);
+  const boState = await step('state');
+  ok('"Exclude backorder items" is on by default', boState.settings.exclude_backorders === 'yes', boState.settings.exclude_backorders);
+
+  let b0 = boMark();
+  let bo = await step('bo_create', { ref: 'BO-NEW', qty: 0, oos: 1 });
+  ok('a new product PrestaShop sells out of stock is not created on Fetch (no row, no listing, nothing sent for it)', bo.rows.length === 0 && boPuts(b0, 'BO-NEW').length === 0 && !(await boListing('BO-NEW')), { bo, puts: boPuts(b0, 'BO-NEW') });
+  bo = await step('bo_create', { ref: 'BO-NEW2', qty: 0, oos: 1 });
+  ok('…the same for a second one, kept for the setting test', bo.rows.length === 0 && !(await boListing('BO-NEW2')), bo);
+  b0 = boMark();
+  bo = await step('bo_stock', { ref: 'BO-NEW', qty: 3 });
+  let item = boPuts(b0, 'BO-NEW').at(-1);
+  ok('when stock returns it is created like any product, with its stock', item?.stockCount === 3 && item.isActive === true && (await boListing('BO-NEW'))?.isActive === true, item);
+
+  bo = await step('bo_create', { ref: 'BO-LINK', qty: 5, oos: 1 });
+  ok('a product with stock is created normally even when out-of-stock orders are allowed', (await boListing('BO-LINK')) && boPuts(0, 'BO-LINK').at(-1)?.stockCount === 5, bo);
+  b0 = boMark();
+  await step('bo_stock', { ref: 'BO-LINK', qty: 0 });
+  item = boPuts(b0, 'BO-LINK').at(-1);
+  ok('when it runs out and becomes a backorder item, the linked listing is updated to stock 0 (still listed)', item?.stockCount === 0 && item.isActive === true, item);
+  b0 = boMark();
+  await step('bo_stock', { ref: 'BO-LINK', qty: 4 });
+  ok('…and comes back when stock returns', boPuts(b0, 'BO-LINK').at(-1)?.stockCount === 4, boPuts(b0, 'BO-LINK'));
+  b0 = boMark();
+  await step('bo_stock', { ref: 'BO-LINK', qty: -2 });
+  ok('negative stock (backorders taken) is sent as 0', boPuts(b0, 'BO-LINK').at(-1)?.stockCount === 0, boPuts(b0, 'BO-LINK'));
+
+  bo = await step('bo_create', { ref: 'BO-DENY', qty: 0, oos: 0 });
+  ok('a product that refuses out-of-stock orders is created with stock 0 (it is not a backorder item)', boPuts(0, 'BO-DENY').at(-1)?.stockCount === 0 && (await boListing('BO-DENY')), bo);
+
+  await step('bo_config', { name: 'PS_ORDER_OUT_OF_STOCK', value: 0 });
+  await step('bo_create', { ref: 'BO-DEF', qty: 0, oos: 2 });
+  ok('"default" behaviour with the shop refusing out-of-stock orders: created (stock 0)', !!(await boListing('BO-DEF')), boPuts(0, 'BO-DEF'));
+  await step('bo_config', { name: 'PS_ORDER_OUT_OF_STOCK', value: 1 });
+  await step('bo_create', { ref: 'BO-DEF2', qty: 0, oos: 2 });
+  ok('"default" behaviour with the shop allowing out-of-stock orders: not created', !(await boListing('BO-DEF2')) && boPuts(0, 'BO-DEF2').length === 0, boPuts(0, 'BO-DEF2'));
+  b0 = boMark();
+  await step('bo_stock', { ref: 'BO-DEF', qty: 0 });
+  await step('bo_oos', { ref: 'BO-DEF', oos: 2 });
+  ok('…an already linked one keeps being updated (stock 0)', boPuts(b0, 'BO-DEF').at(-1)?.stockCount === 0, boPuts(b0, 'BO-DEF'));
+  await step('bo_config', { name: 'PS_ORDER_OUT_OF_STOCK', value: 0 });
+  await step('bo_oos', { ref: 'BO-DEF2', oos: 2 });
+  ok('…and when the shop stops allowing out-of-stock orders, the skipped product is created', !!(await boListing('BO-DEF2')), boPuts(0, 'BO-DEF2'));
+
+  bo = await step('bo_create', { ref: 'BO-CMB', qty: 0, oos: 1, combos: '3,0' });
+  ok('combinations: the one in stock is created, the backorder one is not', bo.rows.length === 1 && !!(await boListing('BO-CMB-BLACK')) && !(await boListing('BO-CMB-WHITE')) && boPuts(0, 'BO-CMB-BLACK').at(-1)?.stockCount === 3, { bo, white: boPuts(0, 'BO-CMB-WHITE') });
+  b0 = boMark();
+  await step('bo_stock', { ref: 'BO-CMB', combo: 'BO-CMB-WHITE', qty: 2 });
+  ok('…when the other one gets stock it is created with it', boPuts(b0, 'BO-CMB-WHITE').at(-1)?.stockCount === 2 && !!(await boListing('BO-CMB-WHITE')), boPuts(b0, 'BO-CMB-WHITE'));
+  b0 = boMark();
+  await step('bo_stock', { ref: 'BO-CMB', combo: 'BO-CMB-BLACK', qty: 0 });
+  ok('…and a linked combination that runs out is updated to stock 0', boPuts(b0, 'BO-CMB-BLACK').at(-1)?.stockCount === 0, boPuts(b0, 'BO-CMB-BLACK'));
+
+  b0 = boMark();
+  let sv2 = await step('bo_save', { on: 0 });
+  ok('turning the setting off resends the catalogue and creates the skipped product (stock 0)', sv2.setting === 'no' && sv2.finished && boPuts(b0, 'BO-NEW2').at(-1)?.stockCount === 0 && !!(await boListing('BO-NEW2')) && sv2.messages.some((m) => /Exclude backorder items.*setting changed/.test(m)), { sv2, puts: boPuts(b0, 'BO-NEW2') });
+  await step('bo_create', { ref: 'BO-OFF', qty: 0, oos: 1 });
+  ok('with the setting off, backorder products are created like any other', !!(await boListing('BO-OFF')), boPuts(0, 'BO-OFF'));
+  sv2 = await step('bo_save', { on: 1 });
+  ok('turning it on again is stored (the form posts it back as on)', sv2.setting === 'yes' && sv2.finished, sv2);
+  await step('bo_create', { ref: 'BO-ON', qty: 0, oos: 1 });
+  ok('…and new backorder products are skipped again', !(await boListing('BO-ON')), boPuts(0, 'BO-ON'));
+  ok('every request passed the mock\'s live rules', mockLog().problems.length === 0, mockLog().problems);
 
   // --- Mirror this shop 1:1 -------------------------------------------------------------------
   const mockListings = async () => (await (await fetch(`${MOCK}/__listings`)).json()).data;
