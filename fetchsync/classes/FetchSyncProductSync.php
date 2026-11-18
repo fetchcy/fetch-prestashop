@@ -11,6 +11,10 @@
  * "Sync all products" queues the whole catalogue the same way; in mirror
  * mode its end also switches off what the shop no longer sells
  * (FetchSyncMirror).
+ *
+ * With multistore, every connected shop syncs to its own Fetch store: a
+ * change is queued once per connected shop that sells the product, and each
+ * shop's queue is sent with that shop's prices, stock, language and markup.
  */
 if (!defined('_PS_VERSION_')) {
     exit;
@@ -29,63 +33,126 @@ class FetchSyncProductSync
 
     private static $flushRegistered = false;
 
-    /** Queue a product (a combination queues its product). */
+    /**
+     * Shops that sync products: connected, with "Sync to Fetch" on.
+     *
+     * @return int[]
+     */
+    public static function syncingShops()
+    {
+        $out = array();
+        foreach (FetchSyncSettings::connectedShopIds() as $idShop) {
+            if ('yes' === FetchSyncSettings::getFor($idShop, 'sync_products')) {
+                $out[] = $idShop;
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Queue a product (a combination queues its product) for every syncing
+     * shop that sells it, or has sent it to Fetch before (so a product taken
+     * out of a shop is switched off in that shop's Fetch store).
+     */
     public static function queue($idProduct)
     {
         $idProduct = (int) $idProduct;
         if ($idProduct <= 0 || $idProduct === (int) FetchSyncSettings::internal('PLACEHOLDER_ID', 0)) {
             return;
         }
+        $queued = false;
+        foreach (self::syncingShops() as $idShop) {
+            $wanted = FetchSyncProductMapper::inShop($idProduct, $idShop) || FetchSyncSettings::withShop($idShop, function () use ($idProduct) {
+                return FetchSyncProductMapper::wasSynced($idProduct);
+            });
+            if ($wanted) {
+                self::queueIn($idShop, $idProduct);
+                $queued = true;
+            }
+        }
+        if ($queued) {
+            self::scheduleFlush();
+        }
+    }
+
+    private static function queueIn($idShop, $idProduct)
+    {
         Db::getInstance()->execute(
-            'INSERT INTO `' . _DB_PREFIX_ . self::QUEUE . '` (`id_product`, `version`, `attempts`, `next_try`, `date_add`)
-            VALUES (' . $idProduct . ', 1, 0, 0, \'' . pSQL(date('Y-m-d H:i:s')) . '\')
+            'INSERT INTO `' . _DB_PREFIX_ . self::QUEUE . '` (`id_shop`, `id_product`, `version`, `attempts`, `next_try`, `date_add`)
+            VALUES (' . (int) $idShop . ', ' . (int) $idProduct . ', 1, 0, 0, \'' . pSQL(date('Y-m-d H:i:s')) . '\')
             ON DUPLICATE KEY UPDATE `version` = `version` + 1, `attempts` = 0, `next_try` = 0'
         );
-        self::scheduleFlush();
     }
 
-    /** A product is being deleted: remember its rows now, it is gone by flush time. */
+    /** A product is being deleted: remember its rows now, in every shop that sent it; it is gone by flush time. */
     public static function queueDeletion(Product $product)
     {
-        if (!FetchSyncProductMapper::supports($product) || !FetchSyncProductMapper::wasSynced($product->id)) {
-            return;
+        $idProduct = (int) $product->id;
+        $queued = false;
+        foreach (self::syncingShops() as $idShop) {
+            $queued = FetchSyncContext::forShop($idShop, function ($idShop) use ($idProduct) {
+                if (!FetchSyncProductMapper::wasSynced($idProduct)) {
+                    return false;
+                }
+                $product = FetchSyncProductMapper::loadProduct($idProduct);
+                if (!FetchSyncProductMapper::supports($product)) {
+                    return false;
+                }
+                foreach (FetchSyncProductMapper::deactivations($product) as $item) {
+                    FetchSyncProductSync::addDeactivation($idShop, $item);
+                }
+                Db::getInstance()->delete(FetchSyncProductSync::QUEUE, '`id_shop` = ' . (int) $idShop . ' AND `id_product` = ' . $idProduct);
+
+                return true;
+            }) || $queued;
         }
-        $product = FetchSyncProductMapper::loadProduct($product->id);
-        foreach (FetchSyncProductMapper::deactivations($product) as $item) {
-            self::addDeactivation($item);
+        if ($queued) {
+            self::scheduleFlush();
         }
-        Db::getInstance()->delete(self::QUEUE, '`id_product` = ' . (int) $product->id);
-        self::scheduleFlush();
     }
 
-    /** A combination is being deleted: switch its own Fetch product off. */
+    /** A combination is being deleted: switch its own Fetch product off, in every shop that sent it. */
     public static function queueCombinationDeletion(Combination $combination)
     {
         $idProduct = (int) $combination->id_product;
         $ipa = (int) $combination->id;
-        if (!$idProduct || !$ipa || !FetchSyncProductMapper::wasSynced($idProduct, $ipa)) {
+        if (!$idProduct || !$ipa) {
             return;
         }
-        $product = FetchSyncProductMapper::loadProduct($idProduct);
-        $found = false;
-        foreach (FetchSyncProductMapper::toFetchItems($product, true) as $pair) {
-            if ((int) $pair[1][1] === $ipa) {
-                self::addDeactivation($pair[0]);
-                $found = true;
-            }
+        $queued = false;
+        foreach (self::syncingShops() as $idShop) {
+            $queued = FetchSyncContext::forShop($idShop, function ($idShop) use ($idProduct, $ipa, $combination) {
+                if (!FetchSyncProductMapper::wasSynced($idProduct, $ipa)) {
+                    return false;
+                }
+                $product = FetchSyncProductMapper::loadProduct($idProduct);
+                $found = false;
+                foreach (FetchSyncProductMapper::toFetchItems($product, true) as $pair) {
+                    if ((int) $pair[1][1] === $ipa) {
+                        FetchSyncProductSync::addDeactivation($idShop, $pair[0]);
+                        $found = true;
+                    }
+                }
+                if (!$found) {
+                    $ref = FetchSyncProductMapper::ref($idProduct, $ipa, $combination->reference);
+                    FetchSyncProductSync::addDeactivation($idShop, FetchSyncProductMapper::deactivation($ref, is_string($product->name) ? $product->name : ''));
+                }
+
+                return true;
+            }) || $queued;
         }
-        if (!$found) {
-            $ref = FetchSyncProductMapper::ref($idProduct, $ipa, $combination->reference);
-            self::addDeactivation(FetchSyncProductMapper::deactivation($ref, is_string($product->name) ? $product->name : ''));
+        if ($queued) {
+            self::scheduleFlush();
         }
-        self::scheduleFlush();
     }
 
-    private static function addDeactivation(array $item)
+    /** @internal */
+    public static function addDeactivation($idShop, array $item)
     {
         Db::getInstance()->execute(
-            'INSERT INTO `' . _DB_PREFIX_ . self::DEACTIVATIONS . '` (`ref`, `payload`, `attempts`, `next_try`)
-            VALUES (\'' . pSQL($item['ref']) . '\', \'' . pSQL(json_encode($item), true) . '\', 0, 0)
+            'INSERT INTO `' . _DB_PREFIX_ . self::DEACTIVATIONS . '` (`id_shop`, `ref`, `payload`, `attempts`, `next_try`)
+            VALUES (' . (int) $idShop . ', \'' . pSQL($item['ref']) . '\', \'' . pSQL(json_encode($item), true) . '\', 0, 0)
             ON DUPLICATE KEY UPDATE `payload` = VALUES(`payload`), `attempts` = 0, `next_try` = 0'
         );
     }
@@ -102,30 +169,60 @@ class FetchSyncProductSync
     public static function shutdownFlush()
     {
         self::$flushRegistered = false;
-        if (!FetchSyncSettings::isConnected()) {
+        if (!FetchSyncSettings::connectedShopIds()) {
             return;
         }
         FetchSyncCron::finishRequest();
         try {
             FetchSyncContext::background();
-            self::flush(20);
+            self::flushAll(20);
         } catch (Exception $e) {
             FetchSyncLogger::error('Product sync stopped: ' . $e->getMessage());
         }
     }
 
-    /** Queue the whole catalogue of the default shop. */
+    /**
+     * Send what is due in every connected shop, each in its own context. A
+     * shop that fails (bad key, Fetch down for it) does not stop the others.
+     *
+     * @return int products sent
+     */
+    public static function flushAll($budget = 20)
+    {
+        $shops = FetchSyncSettings::connectedShopIds();
+        $sent = 0;
+        $deadline = microtime(true) + max(1, (int) $budget);
+        foreach ($shops as $i => $idShop) {
+            // Each shop gets an equal share of what is left.
+            $share = max(1, (int) floor(($deadline - microtime(true)) / (count($shops) - $i)));
+            try {
+                $sent += FetchSyncContext::forShop($idShop, function () use ($share) {
+                    return FetchSyncProductSync::flush($share);
+                });
+            } catch (Exception $e) {
+                FetchSyncSettings::withShop($idShop, function () use ($e) {
+                    FetchSyncLogger::error('Product sync stopped: ' . $e->getMessage());
+                });
+            }
+        }
+
+        return $sent;
+    }
+
+    /** Queue this shop's whole catalogue. */
     public static function startBulkSync($reason = 'Full product sync started')
     {
+        $idShop = FetchSyncSettings::shopId();
+        $placeholder = (int) FetchSyncSettings::internal('PLACEHOLDER_ID', 0);
         $count = (int) Db::getInstance()->getValue(
-            'SELECT COUNT(*) FROM `' . _DB_PREFIX_ . 'product_shop` WHERE `id_shop` = ' . FetchSyncSettings::defaultShopId()
+            'SELECT COUNT(*) FROM `' . _DB_PREFIX_ . 'product_shop` WHERE `id_shop` = ' . $idShop
         );
         Db::getInstance()->execute(
-            'INSERT INTO `' . _DB_PREFIX_ . self::QUEUE . '` (`id_product`, `version`, `attempts`, `next_try`, `date_add`)
-            SELECT ps.`id_product`, 1, 0, 0, \'' . pSQL(date('Y-m-d H:i:s')) . '\'
+            'INSERT INTO `' . _DB_PREFIX_ . self::QUEUE . '` (`id_shop`, `id_product`, `version`, `attempts`, `next_try`, `date_add`)
+            SELECT ' . $idShop . ', ps.`id_product`, 1, 0, 0, \'' . pSQL(date('Y-m-d H:i:s')) . '\'
             FROM `' . _DB_PREFIX_ . 'product_shop` ps
-            WHERE ps.`id_shop` = ' . FetchSyncSettings::defaultShopId() . '
-            AND ps.`id_product` <> ' . (int) FetchSyncSettings::internal('PLACEHOLDER_ID', 0) . '
+            WHERE ps.`id_shop` = ' . $idShop . '
+            AND ps.`id_product` <> ' . $placeholder . '
             ON DUPLICATE KEY UPDATE `version` = `version` + 1, `attempts` = 0, `next_try` = 0'
         );
         FetchSyncSettings::setInternal('BULK_RUNNING', '1');
@@ -136,14 +233,19 @@ class FetchSyncProductSync
         return $count;
     }
 
-    public static function pendingCount()
+    /** Product changes waiting in this shop's queue (null: in every shop's). */
+    public static function pendingCount($idShop = false)
     {
-        return (int) Db::getInstance()->getValue('SELECT COUNT(*) FROM `' . _DB_PREFIX_ . self::QUEUE . '`')
-            + (int) Db::getInstance()->getValue('SELECT COUNT(*) FROM `' . _DB_PREFIX_ . self::DEACTIVATIONS . '`');
+        $idShop = false === $idShop ? FetchSyncSettings::shopId() : $idShop;
+        $where = null === $idShop ? '' : ' WHERE `id_shop` = ' . (int) $idShop;
+
+        return (int) Db::getInstance()->getValue('SELECT COUNT(*) FROM `' . _DB_PREFIX_ . self::QUEUE . '`' . $where)
+            + (int) Db::getInstance()->getValue('SELECT COUNT(*) FROM `' . _DB_PREFIX_ . self::DEACTIVATIONS . '`' . $where);
     }
 
     /**
-     * Send what is due, for at most $budget seconds. One flush at a time.
+     * Send what is due in this shop, for at most $budget seconds. One flush
+     * per shop at a time. Run it inside FetchSyncContext::forShop().
      *
      * @return int products sent
      */
@@ -152,7 +254,9 @@ class FetchSyncProductSync
         if (!FetchSyncSettings::isConnected() || FetchSyncApi::backoffRemaining() > 0) {
             return 0;
         }
-        if (!FetchSyncCron::lock('flush')) {
+        $idShop = FetchSyncSettings::shopId();
+        $lock = self::lockName();
+        if (!FetchSyncCron::lock($lock)) {
             return 0;
         }
         $sent = 0;
@@ -163,7 +267,7 @@ class FetchSyncProductSync
 
             $rows = $db->executeS(
                 'SELECT `ref`, `payload`, `attempts` FROM `' . _DB_PREFIX_ . self::DEACTIVATIONS . '`
-                WHERE `next_try` <= ' . $now . ' LIMIT ' . self::MAX_ITEMS
+                WHERE `id_shop` = ' . $idShop . ' AND `next_try` <= ' . $now . ' LIMIT ' . self::MAX_ITEMS
             );
             if ($rows) {
                 $items = array();
@@ -176,10 +280,11 @@ class FetchSyncProductSync
                 $refs = array_map(function ($row) {
                     return '\'' . pSQL($row['ref']) . '\'';
                 }, $rows);
+                $inShop = '`id_shop` = ' . $idShop . ' AND `ref` IN (' . implode(',', $refs) . ')';
                 if (!$items || self::send($items, array())) {
-                    $db->delete(self::DEACTIVATIONS, '`ref` IN (' . implode(',', $refs) . ')');
+                    $db->delete(self::DEACTIVATIONS, $inShop);
                 } else {
-                    self::delay(self::DEACTIVATIONS, '`ref` IN (' . implode(',', $refs) . ')');
+                    self::delay(self::DEACTIVATIONS, $inShop);
 
                     return 0;
                 }
@@ -188,20 +293,20 @@ class FetchSyncProductSync
             while (microtime(true) < $deadline) {
                 $rows = $db->executeS(
                     'SELECT `id_product`, `version` FROM `' . _DB_PREFIX_ . self::QUEUE . '`
-                    WHERE `next_try` <= ' . time() . ' ORDER BY `date_add`, `id_product` LIMIT ' . self::CHUNK
+                    WHERE `id_shop` = ' . $idShop . ' AND `next_try` <= ' . time() . ' ORDER BY `date_add`, `id_product` LIMIT ' . self::CHUNK
                 );
                 if (!$rows) {
                     break;
                 }
                 $ids = array_map('intval', array_column($rows, 'id_product'));
                 if (!self::syncIds($ids)) {
-                    self::delay(self::QUEUE, '`id_product` IN (' . implode(',', $ids) . ')');
+                    self::delay(self::QUEUE, '`id_shop` = ' . $idShop . ' AND `id_product` IN (' . implode(',', $ids) . ')');
                     break;
                 }
                 $sent += count($ids);
                 foreach ($rows as $row) {
                     // A change that arrived while sending bumped the version: keep it queued.
-                    $db->delete(self::QUEUE, '`id_product` = ' . (int) $row['id_product'] . ' AND `version` = ' . (int) $row['version']);
+                    $db->delete(self::QUEUE, '`id_shop` = ' . $idShop . ' AND `id_product` = ' . (int) $row['id_product'] . ' AND `version` = ' . (int) $row['version']);
                 }
             }
 
@@ -211,10 +316,16 @@ class FetchSyncProductSync
                 FetchSyncMirror::afterFullSync();
             }
         } finally {
-            FetchSyncCron::unlock('flush');
+            FetchSyncCron::unlock($lock);
         }
 
         return $sent;
+    }
+
+    /** The lock that keeps one flush (or mirror run) per shop at a time. */
+    public static function lockName()
+    {
+        return 'flush-' . FetchSyncSettings::shopId();
     }
 
     /** Retry with back-off: 2, 4, 8 … minutes, at most hourly. */
@@ -237,12 +348,19 @@ class FetchSyncProductSync
     {
         $items = array();
         $owners = array();
+        $idShop = FetchSyncSettings::shopId();
         foreach ($ids as $id) {
-            $product = FetchSyncProductMapper::loadProduct($id);
-            if (!FetchSyncProductMapper::supports($product)) {
-                continue;
+            $pairs = array();
+            if (FetchSyncProductMapper::inShop($id, $idShop)) {
+                $product = FetchSyncProductMapper::loadProduct($id);
+                if (FetchSyncProductMapper::supports($product)) {
+                    $pairs = FetchSyncProductMapper::toFetchItems($product);
+                }
+            } elseif (FetchSyncProductMapper::wasSynced($id)) {
+                // Taken out of this shop: switch it off, priced as the shop that still has it.
+                $pairs = self::itemsFromOwnShop($id);
             }
-            foreach (FetchSyncProductMapper::toFetchItems($product) as $pair) {
+            foreach ($pairs as $pair) {
                 list($item, $owner) = $pair;
                 $items[] = $item;
                 $owners[$item['ref']] = $owner;
@@ -258,6 +376,23 @@ class FetchSyncProductSync
         }
 
         return $ok;
+    }
+
+    /** Switched-off items for a product no longer in this shop, built in the product's default shop. */
+    private static function itemsFromOwnShop($idProduct)
+    {
+        $source = (int) Db::getInstance()->getValue(
+            'SELECT `id_shop_default` FROM `' . _DB_PREFIX_ . 'product` WHERE `id_product` = ' . (int) $idProduct
+        );
+        if (!$source || !FetchSyncProductMapper::inShop($idProduct, $source)) {
+            return array();
+        }
+
+        return FetchSyncContext::psShop($source, function () use ($idProduct, $source) {
+            $product = FetchSyncProductMapper::loadProduct($idProduct, $source);
+
+            return FetchSyncProductMapper::supports($product) ? FetchSyncProductMapper::toFetchItems($product, true) : array();
+        });
     }
 
     /**
@@ -360,10 +495,11 @@ class FetchSyncProductSync
         return true;
     }
 
-    /** Store the result; a successful sync also freezes the ref. */
+    /** Store the result in this shop's rows; a successful sync also freezes the ref. */
     private static function record(array $owner, $ref, $status, $error, $fetchProductId)
     {
         list($idProduct, $ipa) = $owner;
+        $idShop = FetchSyncSettings::shopId();
         $set = array(
             '`status` = \'' . pSQL($status) . '\'',
             '`error` = \'' . pSQL(Tools::substr((string) $error, 0, 1000)) . '\'',
@@ -377,8 +513,8 @@ class FetchSyncProductSync
         }
         Db::getInstance()->execute(
             'INSERT INTO `' . _DB_PREFIX_ . FetchSyncProductMapper::TABLE . '`
-            (`id_product`, `id_product_attribute`, `ref`, `fetch_product_id`, `status`, `error`, `synced_at`)
-            VALUES (' . (int) $idProduct . ', ' . (int) $ipa . ', \'' . pSQL((string) $ref) . '\', \'' . pSQL((string) $fetchProductId) . '\',
+            (`id_shop`, `id_product`, `id_product_attribute`, `ref`, `fetch_product_id`, `status`, `error`, `synced_at`)
+            VALUES (' . $idShop . ', ' . (int) $idProduct . ', ' . (int) $ipa . ', \'' . pSQL((string) $ref) . '\', \'' . pSQL((string) $fetchProductId) . '\',
             \'' . pSQL($status) . '\', \'' . pSQL(Tools::substr((string) $error, 0, 1000)) . '\', ' . (int) time() . ')
             ON DUPLICATE KEY UPDATE ' . implode(', ', $set)
         );
@@ -387,7 +523,7 @@ class FetchSyncProductSync
         }
     }
 
-    /** Products whose specific price (sale) started or ended since the last check. */
+    /** Products whose specific price (sale) started or ended since the last check, in every shop. */
     public static function queueSaleBoundaries()
     {
         $now = time();

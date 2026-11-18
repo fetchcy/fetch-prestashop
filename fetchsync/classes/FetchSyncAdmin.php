@@ -3,6 +3,10 @@
  * The module's configuration page (Modules → Module Manager → Fetch →
  * Configure): connection, product sync and catalogue mode, order import,
  * webhook registration, cron URL and recent activity.
+ *
+ * With multistore, the shop chosen in the back office's shop selector is the
+ * one edited. In "All shops" or a group, the page shows an overview of every
+ * shop instead: its Fetch store, last sync and status.
  */
 if (!defined('_PS_VERSION_')) {
     exit;
@@ -16,9 +20,26 @@ class FetchSyncAdmin
     /** @var string[] */
     private $messages = array();
 
-    public function __construct(Module $module)
+    /** @var int|null the shop being edited; null for the overview */
+    private $idShop;
+
+    /**
+     * @param int|null $idShop the shop to edit; default: the back office's shop context
+     */
+    public function __construct(Module $module, $idShop = null)
     {
         $this->module = $module;
+        $this->idShop = null !== $idShop ? (int) $idShop : self::contextShop();
+    }
+
+    /** The shop the back office is set to, or null in "All shops" / a group (multistore only). */
+    public static function contextShop()
+    {
+        if (!FetchSyncSettings::multistore()) {
+            return FetchSyncSettings::defaultShopId();
+        }
+
+        return Shop::CONTEXT_SHOP === Shop::getContext() ? (int) Shop::getContextShopID() : null;
     }
 
     public function content()
@@ -28,19 +49,42 @@ class FetchSyncAdmin
 
             return '';
         }
+        if (null === $this->idShop) {
+            return $this->renderIntro() . $this->overview() . $this->renderCron() . $this->renderActivity(null);
+        }
 
+        $admin = $this;
+
+        return FetchSyncContext::forShop($this->idShop, function () use ($admin) {
+            return $admin->shopPage();
+        });
+    }
+
+    /** @internal the settings page of one shop, in that shop's context */
+    public function shopPage()
+    {
         $this->process();
 
-        return implode('', $this->messages) . $this->mirrorNotice() . $this->renderIntro() . $this->renderForm() . $this->renderActivity();
+        return implode('', $this->messages) . $this->mirrorNotice() . $this->renderIntro() . $this->renderForm() . $this->renderActivity($this->idShop);
     }
 
     /**
-     * Handle a settings form submission.
+     * Handle a settings form submission for the shop being edited.
      *
      * @return string[] the notices it produced (HTML)
      */
     public function process()
     {
+        if (null === $this->idShop) {
+            return $this->messages;
+        }
+        if (FetchSyncSettings::scoped() !== $this->idShop) {
+            $admin = $this;
+
+            return FetchSyncContext::forShop($this->idShop, function () use ($admin) {
+                return $admin->process();
+            });
+        }
         $do = null;
         $actions = array(
             'submitFetchsyncSave' => 'save',
@@ -101,6 +145,10 @@ class FetchSyncAdmin
                     $this->confirm('Settings saved.');
                 }
         }
+        // A shop created after install may lack the module's carrier, placeholder product or hooks.
+        if (FetchSyncSettings::isConnected()) {
+            FetchSyncInstaller::ensureShop($this->idShop);
+        }
     }
 
     /** @return bool true when a changed price markup started a full resync */
@@ -142,6 +190,12 @@ class FetchSyncAdmin
         }
 
         $storeId = $get('store_id');
+        $newBase = 'custom' === $new['environment'] ? $customUrl : (isset(FetchSyncSettings::ENVIRONMENTS[$new['environment']]) ? FetchSyncSettings::ENVIRONMENTS[$new['environment']] : '');
+        $owner = FetchSyncSettings::storeOwner($storeId, $newBase, $this->idShop);
+        if ($owner) {
+            $this->error(sprintf('The Fetch store "%s" is already connected to the shop "%s". Each shop needs its own Fetch store; the store was not changed.', self::storeLabel($storeId), FetchSyncSettings::shopName($owner)));
+            $storeId = '';
+        }
         if ('' !== $storeId) {
             $new['store_id'] = $storeId;
             foreach (self::cachedStores() as $store) {
@@ -209,15 +263,38 @@ class FetchSyncAdmin
         }
         FetchSyncSettings::setInternal('STORES', json_encode($stores));
 
-        // One store, or the saved one is gone: pick for the merchant.
+        // No usable store saved (none, gone, or another shop's): pick the first free one for the merchant.
+        $baseUrl = FetchSyncSettings::baseUrl();
+        $free = array();
+        foreach ($stores as $store) {
+            if (!FetchSyncSettings::storeOwner($store['id'], $baseUrl, $this->idShop)) {
+                $free[] = $store;
+            }
+        }
         $saved = (string) FetchSyncSettings::get('store_id');
-        $ids = array_column($stores, 'id');
-        if (1 === count($stores) || !in_array($saved, $ids, true)) {
-            FetchSyncSettings::update(array('store_id' => $stores[0]['id'], 'store_name' => $stores[0]['name']));
+        if (!in_array($saved, array_column($free, 'id'), true)) {
+            $pick = $free ? $free[0] : array('id' => '', 'name' => '');
+            FetchSyncSettings::update(array('store_id' => $pick['id'], 'store_name' => $pick['name']));
+        }
+        if (!$free) {
+            $this->warning(sprintf('Connected, but every Fetch store of this key (%d) is already connected to another shop. Each shop needs its own Fetch store; ask Fetch to add one to your key.', count($stores)));
+
+            return;
         }
         $this->confirm(1 === count($stores)
             ? 'Connected. 1 store found.'
             : sprintf('Connected. %d stores found — pick one and save.', count($stores)));
+    }
+
+    private static function storeLabel($storeId)
+    {
+        foreach (self::cachedStores() as $store) {
+            if ($store['id'] === (string) $storeId) {
+                return $store['name'];
+            }
+        }
+
+        return (string) $storeId;
     }
 
     private function previewMirror()
@@ -271,7 +348,8 @@ class FetchSyncAdmin
 
             return;
         }
-        if (!FetchSyncCron::lock('flush')) {
+        $lock = FetchSyncProductSync::lockName();
+        if (!FetchSyncCron::lock($lock)) {
             $this->warning('A product sync is running. Try again in a minute.');
 
             return;
@@ -279,7 +357,7 @@ class FetchSyncAdmin
         try {
             $result = FetchSyncMirror::run(true);
         } finally {
-            FetchSyncCron::unlock('flush');
+            FetchSyncCron::unlock($lock);
         }
         if ('failed' === $result['status']) {
             $this->error('Mirror not applied: could not read your Fetch listings (' . $result['error'] . '). Nothing was switched off.');
@@ -337,12 +415,19 @@ class FetchSyncAdmin
 
             return;
         }
-        FetchSyncSettings::update(array(
-            'webhook_secret' => (string) $result['body']['signingSecret'],
-            'webhook_registered' => time(),
-        ));
+        $secret = (string) $result['body']['signingSecret'];
+        $at = time();
+        FetchSyncSettings::update(array('webhook_secret' => $secret, 'webhook_registered' => $at));
+        $others = FetchSyncWebhook::shareSecret($this->idShop, $secret, $at);
         FetchSyncLogger::info('Webhook registered at ' . $url);
-        $this->confirm('Webhook registered. New Fetch orders now arrive instantly.');
+        $message = 'Webhook registered. New Fetch orders now arrive instantly.';
+        if ($others) {
+            $message .= ' ' . sprintf(
+                'The shop(s) %s use the same key, which has one webhook at Fetch, so they now use the new signing secret too. Each order still goes to the shop of its Fetch store.',
+                implode(', ', array_map(array('FetchSyncSettings', 'shopName'), $others))
+            );
+        }
+        $this->confirm($message);
     }
 
     /** @return array<int,array{id:string,name:string}> */
@@ -355,9 +440,89 @@ class FetchSyncAdmin
 
     private function renderIntro()
     {
-        return '<div class="panel"><h3><i class="icon-truck"></i> Fetch</h3><p>'
-            . htmlspecialchars('Sell your PrestaShop products on Fetch. Products, prices and stock sync automatically; Fetch orders arrive as PrestaShop orders.', ENT_QUOTES, 'UTF-8')
-            . '</p></div>';
+        $h = function ($text) {
+            return htmlspecialchars((string) $text, ENT_QUOTES, 'UTF-8');
+        };
+        $html = '<div class="panel"><h3><i class="icon-truck"></i> Fetch</h3><p>'
+            . $h('Sell your PrestaShop products on Fetch. Products, prices and stock sync automatically; Fetch orders arrive as PrestaShop orders.')
+            . '</p>';
+        if (FetchSyncSettings::multistore()) {
+            $html .= null === $this->idShop
+                ? '<p class="fetchsync-overview-help">' . $h('Each shop connects to its own Fetch store. Choose a shop in the shop selector at the top of the page (or press "Edit" below) to change its settings.') . '</p>'
+                : '<p class="fetchsync-shop"><strong>' . $h(sprintf('Settings for the shop "%s".', FetchSyncSettings::shopName($this->idShop))) . '</strong> '
+                    . $h('Other shops have their own settings; choose "All shops" in the shop selector for an overview.') . '</p>';
+        }
+
+        return $html . '</div>';
+    }
+
+    /** "All shops" / group: one row per shop with its Fetch store, last sync and status. */
+    public function overview()
+    {
+        $h = function ($text) {
+            return htmlspecialchars((string) $text, ENT_QUOTES, 'UTF-8');
+        };
+        $group = Shop::CONTEXT_GROUP === Shop::getContext() ? (int) Shop::getContextShopGroupID() : 0;
+        $db = Db::getInstance();
+        $html = '<div class="panel fetchsync-overview"><h3><i class="icon-sitemap"></i> ' . $h('Shops') . '</h3>'
+            . '<table class="table"><thead><tr><th>' . implode('</th><th>', array_map($h, array('Shop', 'Fetch store', 'Sync to Fetch', 'Last product sync', 'Waiting', 'Last Fetch order', 'Status', ''))) . '</th></tr></thead><tbody>';
+        foreach (FetchSyncSettings::shopIds() as $idShop) {
+            if ($group && (int) Shop::getGroupFromShop($idShop) !== $group) {
+                continue;
+            }
+            $row = FetchSyncSettings::withShop($idShop, function ($idShop) use ($db) {
+                $lastSync = (int) $db->getValue('SELECT MAX(`synced_at`) FROM `' . _DB_PREFIX_ . FetchSyncProductMapper::TABLE . '` WHERE `id_shop` = ' . (int) $idShop . ' AND `status` = \'synced\'');
+                $lastOrder = (int) $db->getValue('SELECT MAX(`date_add`) FROM `' . _DB_PREFIX_ . FetchSyncOrderSync::TABLE . '` WHERE `id_shop` = ' . (int) $idShop . ' AND `id_order` > 0');
+                $lastLog = $db->getRow('SELECT `level`, `message`, `date_add` FROM `' . _DB_PREFIX_ . FetchSyncLogger::TABLE . '` WHERE `id_shop` = ' . (int) $idShop . ' ORDER BY `id_fetchsync_log` DESC');
+
+                return array(
+                    'connected' => FetchSyncSettings::isConnected(),
+                    'store' => (string) FetchSyncSettings::get('store_name') ?: (string) FetchSyncSettings::get('store_id'),
+                    'store_id' => (string) FetchSyncSettings::get('store_id'),
+                    'sync' => FetchSyncSettings::enabled('sync_products'),
+                    'mirror' => FetchSyncSettings::mirrorMode(),
+                    'last_sync' => $lastSync,
+                    'last_order' => $lastOrder,
+                    'pending' => FetchSyncProductSync::pendingCount($idShop),
+                    'backoff' => FetchSyncApi::backoffRemaining(),
+                    'held' => FetchSyncSettings::mirrorMode() && FetchSyncMirror::pending(),
+                    'log' => is_array($lastLog) ? $lastLog : null,
+                );
+            });
+            if (!$row['connected']) {
+                $status = 'Not connected';
+            } elseif ($row['backoff'] > 0) {
+                $status = sprintf('Paused: Fetch asked to slow down (%d s)', $row['backoff']);
+            } elseif ($row['held']) {
+                $status = 'Mirror held: waiting for "Apply anyway"';
+            } elseif ($row['log'] && 'error' === $row['log']['level']) {
+                $status = 'Error: ' . Tools::substr($row['log']['message'], 0, 160);
+            } else {
+                $status = 'Connected';
+            }
+            $edit = AdminController::$currentIndex . '&configure=' . $this->module->name . '&token=' . Tools::getAdminTokenLite('AdminModules') . '&setShopContext=s-' . (int) $idShop;
+            $html .= '<tr data-shop="' . (int) $idShop . '"><td>' . $h(FetchSyncSettings::shopName($idShop)) . ($idShop === FetchSyncSettings::defaultShopId() ? ' <span class="label label-default">' . $h('default') . '</span>' : '') . '</td>'
+                . '<td>' . ($row['connected'] ? $h($row['store']) . ($row['store'] !== $row['store_id'] ? ' <small>(' . $h($row['store_id']) . ')</small>' : '') . ($row['mirror'] ? ' <span class="label label-info">' . $h('mirror') . '</span>' : '') : '<em>' . $h('Not connected') . '</em>') . '</td>'
+                . '<td>' . $h($row['connected'] ? ($row['sync'] ? 'On' : 'Off') : '–') . '</td>'
+                . '<td>' . $h($row['last_sync'] ? date('Y-m-d H:i', $row['last_sync']) : '–') . '</td>'
+                . '<td>' . (int) $row['pending'] . '</td>'
+                . '<td>' . $h($row['last_order'] ? date('Y-m-d H:i', $row['last_order']) : '–') . '</td>'
+                . '<td class="fetchsync-status">' . $h($status) . '</td>'
+                . '<td><a class="btn btn-default" href="' . $h($edit) . '"><i class="icon-pencil"></i> ' . $h('Edit') . '</a></td></tr>';
+        }
+
+        return $html . '</tbody></table></div>';
+    }
+
+    /** The cron URL, shared by every shop (overview only; a shop's page shows it under Orders). */
+    private function renderCron()
+    {
+        $h = function ($text) {
+            return htmlspecialchars((string) $text, ENT_QUOTES, 'UTF-8');
+        };
+
+        return '<div class="panel"><h3><i class="icon-time"></i> ' . $h('Cron URL') . '</h3><p><code>' . $h(FetchSyncCron::url()) . '</code></p>'
+            . '<p class="help-block">' . $h('One URL for every shop: each run sends every shop\'s queued product changes and picks up every shop\'s orders. Call it every 1–2 minutes from your server\'s cron.') . '</p></div>';
     }
 
     private function renderForm()
@@ -372,7 +537,8 @@ class FetchSyncAdmin
         if ($stores) {
             $options = array();
             foreach ($stores as $store) {
-                $options[] = array('id' => $store['id'], 'name' => $store['name']);
+                $owner = FetchSyncSettings::storeOwner($store['id'], FetchSyncSettings::baseUrl(), $this->idShop);
+                $options[] = array('id' => $store['id'], 'name' => $store['name'] . ($owner ? ' — ' . sprintf('connected to the shop "%s"', FetchSyncSettings::shopName($owner)) : ''));
             }
             $storeInput = array(
                 'type' => 'select',
@@ -396,7 +562,7 @@ class FetchSyncAdmin
             . '<p class="help-block">' . $h('Fetch then sends new orders here instantly. Without it, orders are still picked up every 2 minutes.') . '</p>';
 
         $cronHtml = '<p><code>' . $h(FetchSyncCron::url()) . '</code></p>'
-            . '<p class="help-block">' . $h('Call this URL every 1–2 minutes from your server\'s cron (for example: curl -s "<URL>" > /dev/null). It sends queued product changes and picks up orders. Without it the module does the same work at most every 2 minutes while your shop or back office is being used.') . '</p>';
+            . '<p class="help-block">' . $h('Call this URL every 1–2 minutes from your server\'s cron (for example: curl -s "<URL>" > /dev/null). It sends queued product changes and picks up orders' . (FetchSyncSettings::multistore() ? ', for every shop' : '') . '. Without it the module does the same work at most every 2 minutes while your shop or back office is being used.') . '</p>';
 
         $switch = function ($name, $label, $desc = '') {
             return array(
@@ -530,10 +696,12 @@ class FetchSyncAdmin
         return $helper->generateForm($forms);
     }
 
-    private function renderActivity()
+    /** @param int|null $idShop one shop's activity, or every shop's (with a shop column) */
+    private function renderActivity($idShop)
     {
-        $rows = FetchSyncLogger::activity(20);
-        $pending = FetchSyncProductSync::pendingCount();
+        $rows = FetchSyncLogger::activity(20, $idShop);
+        $pending = FetchSyncProductSync::pendingCount($idShop);
+        $withShop = null === $idShop && FetchSyncSettings::multistore();
         $h = function ($text) {
             return htmlspecialchars((string) $text, ENT_QUOTES, 'UTF-8');
         };
@@ -547,7 +715,9 @@ class FetchSyncAdmin
             $html .= '<table class="table"><tbody>';
             foreach ($rows as $row) {
                 $level = 'error' === $row['level'] ? '<span class="label label-danger">Error</span>' : '<span class="label label-info">Info</span>';
-                $html .= '<tr><td style="width:170px">' . $h($row['date_add']) . '</td><td style="width:70px">' . $level . '</td><td>' . $h($row['message']) . '</td></tr>';
+                $html .= '<tr><td style="width:170px">' . $h($row['date_add']) . '</td><td style="width:70px">' . $level . '</td>'
+                    . ($withShop ? '<td style="width:160px">' . $h((int) $row['id_shop'] ? FetchSyncSettings::shopName((int) $row['id_shop']) : '') . '</td>' : '')
+                    . '<td>' . $h($row['message']) . '</td></tr>';
             }
             $html .= '</tbody></table><p class="help-block">' . $h('Full log: Advanced Parameters → Logs, object type "FetchSync".') . '</p>';
         }

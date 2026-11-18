@@ -13,6 +13,11 @@
  * never emails it), the delivery address, the lines at the prices the
  * customer paid on Fetch, and the delivery fee as shipping. PrestaShop reduces
  * the stock; the stock change flows back to Fetch through the product sync.
+ *
+ * With multistore, an order for Fetch store X goes into the shop connected to
+ * X: that shop's id, currency, language, customers and products. Everything
+ * here runs for one shop (FetchSyncContext::forShop); the link table is keyed
+ * on the Fetch order id across shops, so an order is never imported twice.
  */
 if (!defined('_PS_VERSION_')) {
     exit;
@@ -40,13 +45,14 @@ class FetchSyncOrderSync
         return false;
     }
 
-    /** Pull recent orders and import or update each one. */
+    /** Pull this shop's recent orders and import or update each one. */
     public static function poll()
     {
         if (!FetchSyncSettings::enabled('import_orders') || !FetchSyncSettings::isConnected() || FetchSyncApi::backoffRemaining() > 0) {
             return false;
         }
-        if (!FetchSyncCron::lock('poll')) {
+        $lock = 'poll-' . FetchSyncSettings::shopId();
+        if (!FetchSyncCron::lock($lock)) {
             return false;
         }
         try {
@@ -75,7 +81,7 @@ class FetchSyncOrderSync
                 $query['cursor'] = (string) $body['nextCursor'];
             }
         } finally {
-            FetchSyncCron::unlock('poll');
+            FetchSyncCron::unlock($lock);
         }
 
         return true;
@@ -91,7 +97,7 @@ class FetchSyncOrderSync
             return 0;
         }
         if (!empty($data['storeId']) && (string) $data['storeId'] !== (string) FetchSyncSettings::get('store_id')) {
-            return 0; // Another store on the same credential.
+            return 0; // Another store on the same credential (another shop's, or none).
         }
         $fetchId = (string) $data['orderId'];
         $status = (string) $data['status'];
@@ -184,6 +190,7 @@ class FetchSyncOrderSync
         }
         Db::getInstance()->insert(self::TABLE, array(
             'fetch_order_id' => pSQL($fetchId),
+            'id_shop' => (int) Db::getInstance()->getValue('SELECT `id_shop` FROM `' . _DB_PREFIX_ . 'orders` WHERE `id_order` = ' . $idOrder),
             'id_order' => $idOrder,
             'fetch_status' => '',
             'date_add' => time(),
@@ -198,6 +205,7 @@ class FetchSyncOrderSync
         $db = Db::getInstance();
         $db->insert(self::TABLE, array(
             'fetch_order_id' => pSQL((string) $data['orderId']),
+            'id_shop' => FetchSyncSettings::shopId(),
             'id_order' => 0,
             'fetch_order_number' => pSQL(isset($data['orderNumber']) ? (string) $data['orderNumber'] : ''),
             'fetch_store_id' => pSQL(isset($data['storeId']) ? (string) $data['storeId'] : ''),
@@ -219,17 +227,32 @@ class FetchSyncOrderSync
     /** @return int PrestaShop order id, 0 on failure */
     private static function create(array $data)
     {
-        $idShop = FetchSyncSettings::defaultShopId();
+        $idShop = FetchSyncSettings::shopId();
+
+        return FetchSyncContext::psShop($idShop, function () use ($data, $idShop) {
+            return FetchSyncOrderSync::createInShop($data, $idShop);
+        });
+    }
+
+    /**
+     * create() in the shop's own context: its language, currency (the
+     * order's when the shop has it) and customers.
+     *
+     * @internal used by create()
+     */
+    public static function createInShop(array $data, $idShop)
+    {
+        FetchSyncInstaller::ensureShop($idShop);
         $shop = new Shop($idShop);
         $language = new Language(FetchSyncSettings::defaultLangId());
         $idCurrency = !empty($data['currency']) ? (int) Currency::getIdByIsoCode((string) $data['currency'], $idShop) : 0;
         if (!$idCurrency) {
-            $idCurrency = (int) Configuration::get('PS_CURRENCY_DEFAULT');
+            $idCurrency = FetchSyncSettings::currencyId();
         }
         $currency = new Currency($idCurrency, null, $idShop);
         $country = new Country((int) Country::getByIso('CY'));
         if (!Validate::isLoadedObject($country) || !$country->active) {
-            $country = new Country((int) Configuration::get('PS_COUNTRY_DEFAULT'));
+            $country = new Country(FetchSyncSettings::countryId());
         }
         $carrier = FetchSyncInstaller::carrier();
         $idState = self::stateId(FetchSyncOrderMapper::stateKey((string) $data['status']));
@@ -238,7 +261,6 @@ class FetchSyncOrderSync
             throw new PrestaShopException('the Fetch module is not fully installed (order states, carrier) or is disabled.');
         }
 
-        Shop::setContext(Shop::CONTEXT_SHOP, $idShop);
         $values = array(
             'shop' => $shop,
             'language' => $language,
@@ -457,7 +479,10 @@ class FetchSyncOrderSync
         return true;
     }
 
-    /** Our frozen ref first, then a combination or product reference, then ps-<id>[-<ipa>]. */
+    /**
+     * This shop's frozen ref first, then a combination or product reference
+     * among the shop's products, then ps-<id>[-<ipa>].
+     */
     public static function productForRef($ref)
     {
         $ref = trim((string) $ref);
@@ -466,20 +491,22 @@ class FetchSyncOrderSync
         }
         $db = Db::getInstance();
         $placeholder = (int) FetchSyncSettings::internal('PLACEHOLDER_ID', 0);
+        $idShop = FetchSyncSettings::shopId();
 
         $row = $db->getRow(
             'SELECT fp.`id_product`, fp.`id_product_attribute` FROM `' . _DB_PREFIX_ . FetchSyncProductMapper::TABLE . '` fp
             INNER JOIN `' . _DB_PREFIX_ . 'product` p ON p.`id_product` = fp.`id_product`
-            WHERE fp.`ref` = \'' . pSQL($ref) . '\''
+            WHERE fp.`id_shop` = ' . $idShop . ' AND fp.`ref` = \'' . pSQL($ref) . '\''
         );
         if ($row && self::validTarget((int) $row['id_product'], (int) $row['id_product_attribute'])) {
             return array((int) $row['id_product'], (int) $row['id_product_attribute']);
         }
 
         $row = $db->getRow(
-            'SELECT MIN(`id_product`) AS `id_product`, MIN(`id_product_attribute`) AS `id_product_attribute`
-            FROM `' . _DB_PREFIX_ . 'product_attribute`
-            WHERE `reference` = \'' . pSQL($ref) . '\' HAVING COUNT(*) = 1'
+            'SELECT MIN(pa.`id_product`) AS `id_product`, MIN(pa.`id_product_attribute`) AS `id_product_attribute`
+            FROM `' . _DB_PREFIX_ . 'product_attribute` pa
+            INNER JOIN `' . _DB_PREFIX_ . 'product_shop` ps ON ps.`id_product` = pa.`id_product` AND ps.`id_shop` = ' . $idShop . '
+            WHERE pa.`reference` = \'' . pSQL($ref) . '\' HAVING COUNT(*) = 1'
         );
         if ($row) {
             return array((int) $row['id_product'], (int) $row['id_product_attribute']);
@@ -487,6 +514,7 @@ class FetchSyncOrderSync
 
         $idProduct = (int) $db->getValue(
             'SELECT p.`id_product` FROM `' . _DB_PREFIX_ . 'product` p
+            INNER JOIN `' . _DB_PREFIX_ . 'product_shop` ps ON ps.`id_product` = p.`id_product` AND ps.`id_shop` = ' . $idShop . '
             WHERE p.`reference` = \'' . pSQL($ref) . '\' AND p.`id_product` <> ' . $placeholder . '
             AND NOT EXISTS (SELECT 1 FROM `' . _DB_PREFIX_ . 'product_attribute` pa WHERE pa.`id_product` = p.`id_product`)
             ORDER BY p.`id_product`'

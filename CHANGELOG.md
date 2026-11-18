@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.3.0 (beta)
+
+- **Multistore.** Every shop of a multistore installation can be connected to its own Fetch store, independently.
+  Credentials, server, Fetch store, sync, price markup, catalogue mode, order import, auto-accept, preparation time and webhook secret are set per shop, as PrestaShop per-shop configuration, through the back office's shop selector.
+- In **All shops** or a shop group, the configuration page shows an overview of every shop: its Fetch store, last sync and status.
+- Shops can share a Partner key that covers several Fetch stores; each shop picks its own store, and two shops cannot pick the same one.
+- A product change is queued for every connected shop that sells the product, and each Fetch store gets that shop's price, sale and specific prices, stock (shared or not within the shop group), active state, language, currency and markup.
+  Full sync, mirror mode and the queue run per shop.
+- A Fetch order goes into the shop connected to its Fetch store, with that shop's currency, language and customers.
+  The Fetch carrier and placeholder product are associated with every shop, including shops created later.
+- Webhooks are routed by the delivery's Fetch store and verified with that shop's secret, on any shop's domain.
+- One cron URL processes every connected shop; a shop whose key fails does not stop the others.
+- Without multistore nothing changes.
+  The upgrade from 1.2.0 keeps every setting and adds the shop to the module's sync, order and log tables; nothing needs reconfiguring.
+
 ## 1.2.0 (beta)
 
 - **Specs.** Product features are sent to Fetch as specs (name and value), in the order the shop shows them.

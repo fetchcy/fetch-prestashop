@@ -179,6 +179,97 @@ function e2e_full_sync()
     );
 }
 
+
+// --- Multistore helpers (tests/e2e/multistore.mjs, upgrade.mjs) ------------------
+
+/** Shop id by name (0 when it does not exist). */
+function ms_shop($name)
+{
+    return (int) Db::getInstance()->getValue('SELECT id_shop FROM ' . _DB_PREFIX_ . 'shop WHERE name = \'' . pSQL($name) . '\' AND deleted = 0');
+}
+
+/** Shop ids of the scenario: A is the default shop, B and C are created by ms_setup. */
+function ms_shops()
+{
+    return array_filter(array('A' => (int) Configuration::get('PS_SHOP_DEFAULT'), 'B' => ms_shop('Shop B'), 'C' => ms_shop('Shop C')));
+}
+
+/** A new shop copied from the default one, like Shop parameters → Add shop with "Import data". */
+function ms_create_shop($name, $idGroup, $domain, $virtualUri, array $import)
+{
+    $from = new Shop((int) Configuration::get('PS_SHOP_DEFAULT'));
+    $shop = new Shop();
+    $shop->name = $name;
+    $shop->id_shop_group = (int) $idGroup;
+    $shop->id_category = (int) $from->id_category;
+    $shop->theme_name = $from->theme_name;
+    $shop->color = '';
+    $shop->active = 1;
+    $shop->deleted = 0;
+    $shop->add();
+    $url = new ShopUrl();
+    $url->id_shop = (int) $shop->id;
+    $url->domain = $domain;
+    $url->domain_ssl = $domain;
+    $url->physical_uri = $from->physical_uri;
+    $url->virtual_uri = $virtualUri;
+    $url->main = 1;
+    $url->active = 1;
+    $url->add();
+    // copyShopData() reads the root categories the form posts.
+    $_POST['categoryBox'] = array((int) Configuration::get('PS_ROOT_CATEGORY'), (int) $from->id_category);
+    $shop->copyShopData((int) $from->id, $import);
+    Category::updateFromShop($_POST['categoryBox'], (int) $shop->id);
+    $shop->associateSuperAdmins();
+    Db::getInstance()->execute('INSERT IGNORE INTO ' . _DB_PREFIX_ . 'group_shop (id_shop, id_group) VALUES (' . (int) $shop->id . ', ' . (int) Configuration::get('PS_UNIDENTIFIED_GROUP') . '), (' . (int) $shop->id . ', ' . (int) Configuration::get('PS_GUEST_GROUP') . '), (' . (int) $shop->id . ', ' . (int) Configuration::get('PS_CUSTOMER_GROUP') . ')');
+
+    return (int) $shop->id;
+}
+
+/** "Save settings" for one shop, from its own settings plus $extra. */
+function ms_save($module, $idShop, array $extra)
+{
+    $post = FetchSyncSettings::withShop($idShop, function () use ($extra) {
+        return e2e_settings_post($extra);
+    });
+    $_POST = $post;
+    $admin = new FetchSyncAdmin($module, $idShop);
+
+    return array_map(function ($html) {
+        return trim(preg_replace('/\s+/', ' ', html_entity_decode(strip_tags($html), ENT_QUOTES, 'UTF-8')));
+    }, $admin->process());
+}
+
+/** A shop's settings without the secrets. */
+function ms_settings($idShop)
+{
+    return FetchSyncSettings::withShop($idShop, function () {
+        $s = FetchSyncSettings::all();
+        $s['has_secret'] = '' !== (string) $s['client_secret'];
+        $s['webhook_secret_hint'] = '' !== (string) $s['webhook_secret'] ? Tools::substr((string) $s['webhook_secret'], 0, 10) : '';
+        unset($s['client_secret'], $s['webhook_secret']);
+        $s['connected'] = FetchSyncSettings::isConnected();
+
+        return $s;
+    });
+}
+
+/** The module's objects associated with a shop. */
+function ms_associations($idShop)
+{
+    $db = Db::getInstance();
+    $carrier = FetchSyncInstaller::carrier();
+    $placeholder = (int) FetchSyncSettings::internal('PLACEHOLDER_ID', 0);
+
+    return array(
+        'module' => (bool) $db->getValue('SELECT 1 FROM ' . _DB_PREFIX_ . 'module_shop WHERE id_module = ' . (int) Module::getModuleIdByName('fetchsync') . ' AND id_shop = ' . (int) $idShop),
+        'hooks' => (int) $db->getValue('SELECT COUNT(*) FROM ' . _DB_PREFIX_ . 'hook_module WHERE id_module = ' . (int) Module::getModuleIdByName('fetchsync') . ' AND id_shop = ' . (int) $idShop),
+        'carrier' => (bool) $db->getValue('SELECT 1 FROM ' . _DB_PREFIX_ . 'carrier_shop WHERE id_carrier = ' . (int) $carrier->id . ' AND id_shop = ' . (int) $idShop),
+        'carrier_lang' => (bool) $db->getValue('SELECT 1 FROM ' . _DB_PREFIX_ . 'carrier_lang WHERE id_carrier = ' . (int) $carrier->id . ' AND id_shop = ' . (int) $idShop),
+        'placeholder' => (bool) $db->getValue('SELECT 1 FROM ' . _DB_PREFIX_ . 'product_shop WHERE id_product = ' . $placeholder . ' AND id_shop = ' . (int) $idShop),
+    );
+}
+
 switch ($step) {
     case 'ping':
         // Up = PrestaShop finished installing itself (config, languages, order states, catalogue).
@@ -192,6 +283,13 @@ switch ($step) {
 
     case 'module':
         // Install/uninstall over HTTP (PrestaShop 1.7's console cannot boot a shop in this image).
+        // Installing a module updates translations through the Symfony container, which a plain script lacks.
+        global $kernel;
+        if (!$kernel && is_file(_PS_ROOT_DIR_ . '/app/AppKernel.php')) {
+            require_once _PS_ROOT_DIR_ . '/app/AppKernel.php';
+            $kernel = new AppKernel('prod', false);
+            $kernel->boot();
+        }
         $instance = Module::getInstanceByName('fetchsync');
         $out['ok'] = 'install' === $_GET['do'] ? (bool) $instance->install() : (bool) $instance->uninstall();
         $out['errors'] = $instance->getErrors();
@@ -529,6 +627,242 @@ switch ($step) {
         $out['notice'] = (new FetchSyncAdmin($module))->mirrorNotice();
         $out['activity'] = array_column(FetchSyncLogger::activity(5), 'message');
         $out['settings_kept'] = FetchSyncSettings::isConnected() && FetchSyncSettings::mirrorMode();
+        break;
+
+    // --- Multistore --------------------------------------------------------------------
+
+    case 'ms_setup':
+        // Shop A (the default shop) is connected the 1.2.0 way, while there is one shop.
+        Configuration::updateValue('PS_MAIL_METHOD', 3);
+        FetchSyncSettings::update(array(
+            'environment' => 'custom',
+            'custom_base_url' => $mockUrl,
+            'client_id' => 'client-1',
+            'client_secret' => 'secret-1',
+            'sync_products' => 'yes',
+            'import_orders' => 'yes',
+            'auto_accept' => 'no',
+            'prep_minutes' => 20,
+            'price_markup' => '0',
+            'store_id' => 'store-1',
+            'store_name' => 'Mock Shop',
+        ));
+        FetchSyncApi::forgetToken();
+        $hook = (new FetchSyncApi())->registerWebhook(FetchSyncWebhook::url());
+        FetchSyncSettings::update(array('webhook_secret' => $hook['body']['signingSecret'], 'webhook_registered' => time()));
+        $tax = e2e_tax_group();
+        $mug = e2e_simple('Shared Mug', 'MUG-1', 10.00, 5, $tax);
+        $db->execute('DELETE FROM ' . _DB_PREFIX_ . 'fetchsync_queue');
+        $out['cron_token'] = FetchSyncSettings::get('cron_token');
+
+        // Multistore on, shop B in the default group on its own domain, with every
+        // kind of data (the module's too, so actionShopDataDuplication runs).
+        Configuration::updateGlobalValue('PS_MULTISHOP_FEATURE_ACTIVE', 1);
+        $port = (int) $_GET['ps_port'];
+        $all = array();
+        foreach (array_keys(Shop::getAssoTables()) as $table) {
+            $all[$table] = true;
+        }
+        $all['ModuleFetchsync'] = true;
+        $default = new Shop((int) Configuration::get('PS_SHOP_DEFAULT'));
+        $idB = ms_create_shop('Shop B', (int) $default->id_shop_group, '127.0.0.1:' . $port, '', $all);
+
+        // Shop C in a group that shares stock, on shop A's domain under /c/, created
+        // without the module's data: the module catches up lazily.
+        $group = new ShopGroup();
+        $group->name = 'Group 2';
+        $group->share_customer = 1;
+        $group->share_stock = 1;
+        $group->share_order = 0;
+        $group->active = 1;
+        $group->add();
+        $some = array();
+        foreach (array('product', 'category', 'lang', 'currency', 'country', 'zone', 'group', 'tax_rules_group', 'attribute_group', 'feature', 'image', 'meta_lang') as $table) {
+            $some[$table] = true;
+        }
+        $idC = ms_create_shop('Shop C', (int) $group->id, 'localhost:' . $port, 'c/', $some);
+
+        // Shop B sells the mug at 12.00 with 3 in stock; shop C's group has 7.
+        $db->update('product_shop', array('price' => round(12.00 / 1.19, 6)), 'id_product = ' . (int) $mug->id . ' AND id_shop = ' . $idB);
+        StockAvailable::setQuantity((int) $mug->id, 0, 3, $idB);
+        StockAvailable::setQuantity((int) $mug->id, 0, 7, $idC);
+        $db->execute('DELETE FROM ' . _DB_PREFIX_ . 'fetchsync_queue');
+        $out['shops'] = array('A' => (int) $default->id, 'B' => $idB, 'C' => $idC);
+        $out['group_c'] = (int) $group->id;
+        $out['mug'] = (int) $mug->id;
+        $out['assoc_b'] = ms_associations($idB);
+        $out['assoc_c_before'] = ms_associations($idC);
+        break;
+
+    case 'ms_add_shop':
+        // Multistore turned on after the fact, with a copy of the default shop.
+        Configuration::updateGlobalValue('PS_MULTISHOP_FEATURE_ACTIVE', 1);
+        $all = array();
+        foreach (array_keys(Shop::getAssoTables()) as $table) {
+            $all[$table] = true;
+        }
+        $all['ModuleFetchsync'] = true;
+        $default = new Shop((int) Configuration::get('PS_SHOP_DEFAULT'));
+        $out['B'] = ms_create_shop('Shop B', (int) $default->id_shop_group, '127.0.0.1:' . (int) $_GET['ps_port'], '', $all);
+        $out['assoc_b'] = ms_associations($out['B']);
+        break;
+
+    case 'ms_state':
+        // A fresh request: multistore is now on.
+        $shops = ms_shops();
+        $out['multistore'] = FetchSyncSettings::multistore();
+        $out['shops'] = $shops;
+        foreach ($shops as $key => $idShop) {
+            $out['settings'][$key] = ms_settings($idShop);
+            $out['assoc'][$key] = ms_associations($idShop);
+            $out['pending'][$key] = FetchSyncProductSync::pendingCount($idShop);
+        }
+        $out['connected'] = FetchSyncSettings::connectedShopIds();
+        $out['legacy_adopted'] = (int) Configuration::getGlobalValue('FETCHSYNC_LEGACY_ADOPTED');
+        $out['a_has_own_rows'] = (bool) $db->getValue('SELECT 1 FROM ' . _DB_PREFIX_ . 'configuration WHERE name = \'FETCHSYNC_STORE_ID\' AND id_shop = ' . (int) $shops['A']);
+        $out['cron_token'] = FetchSyncSettings::get('cron_token');
+        $out['cron_url'] = FetchSyncCron::url();
+        $out['activity'] = array_column(FetchSyncLogger::activity(10, null), 'message');
+        break;
+
+    case 'ms_adopt':
+        $out['adopted'] = FetchSyncSettings::adoptLegacy();
+        $out['legacy_adopted'] = (int) Configuration::getGlobalValue('FETCHSYNC_LEGACY_ADOPTED');
+        break;
+
+    case 'ms_save':
+        // "Save settings" (or another button) for one shop; extra fields come from the query.
+        $shops = ms_shops();
+        $idShop = $shops[$_GET['shop']];
+        $extra = isset($_GET['fields']) ? json_decode($_GET['fields'], true) : array();
+        // Webhook URLs must be https; pretend the shop is.
+        Configuration::set('PS_SSL_ENABLED', 1, 0, 0);
+        Configuration::set('PS_SSL_ENABLED_EVERYWHERE', 1, 0, 0);
+        $out['messages'] = ms_save($module, $idShop, $extra);
+        $out['settings'] = ms_settings($idShop);
+        $out['assoc'] = ms_associations($idShop);
+        $out['webhook_url'] = FetchSyncSettings::withShop($idShop, function () {
+            return FetchSyncWebhook::url();
+        });
+        break;
+
+    case 'ms_touch':
+        // A product edit in "All shops": every syncing shop that sells it is queued.
+        $id = e2e_product_id((string) $_GET['ref']);
+        $p = new Product($id);
+        $p->update();
+        $out['queued'] = array();
+        foreach (ms_shops() as $key => $idShop) {
+            $out['queued'][$key] = (bool) $db->getValue('SELECT 1 FROM ' . _DB_PREFIX_ . 'fetchsync_queue WHERE id_shop = ' . $idShop . ' AND id_product = ' . $id);
+        }
+        break;
+
+    case 'ms_stock':
+        $shops = ms_shops();
+        $id = e2e_product_id((string) $_GET['ref']);
+        $out['stock'] = array();
+        foreach ($shops as $key => $idShop) {
+            $out['stock'][$key] = (int) StockAvailable::getQuantityAvailableByProduct($id, 0, $idShop);
+        }
+        break;
+
+    case 'ms_order':
+        $idOrder = FetchSyncOrderSync::find((string) $_GET['order']);
+        $out['id_order'] = $idOrder;
+        if ($idOrder) {
+            $order = new Order($idOrder);
+            $customer = new Customer((int) $order->id_customer);
+            $currency = new Currency((int) $order->id_currency);
+            $out['id_shop'] = (int) $order->id_shop;
+            $out['id_shop_group'] = (int) $order->id_shop_group;
+            $out['id_lang'] = (int) $order->id_lang;
+            $out['currency'] = $currency->iso_code;
+            $out['customer_shop'] = (int) $customer->id_shop;
+            $out['row'] = FetchSyncOrderSync::rowForOrder($idOrder);
+            $out['state'] = (int) $order->current_state;
+            $out['carrier'] = (int) $order->id_carrier;
+            $out['fetch_carrier'] = (int) FetchSyncInstaller::carrier()->id;
+            $out['items'] = array();
+            foreach ($order->getProductsDetail() as $d) {
+                $out['items'][] = array('product_id' => (int) $d['product_id'], 'reference' => $d['product_reference'], 'qty' => (int) $d['product_quantity'], 'total' => (float) $d['total_price_tax_incl']);
+            }
+            $out['count_by_transaction'] = (int) $db->getValue('SELECT COUNT(DISTINCT o.id_order) FROM ' . _DB_PREFIX_ . 'orders o INNER JOIN ' . _DB_PREFIX_ . 'order_payment op ON op.order_reference = o.reference WHERE op.transaction_id = \'' . pSQL((string) $_GET['order']) . '\'');
+        }
+        $out['states'] = e2e_states();
+        foreach (ms_shops() as $key => $idShop) {
+            $out['shop_lang'][$key] = FetchSyncSettings::withShop($idShop, function () {
+                return FetchSyncSettings::defaultLangId();
+            });
+        }
+        break;
+
+    case 'ms_action':
+        $idOrder = FetchSyncOrderSync::find((string) $_GET['order']);
+        $out['error'] = FetchSyncOrderActions::run($idOrder, (string) $_GET['do'], array('prepMinutes' => 10));
+        $out['row'] = FetchSyncOrderSync::rowForOrder($idOrder);
+        break;
+
+    case 'ms_full_sync':
+        // "Sync all products now" on one shop, flushed to the end (mirror runs there).
+        $shops = ms_shops();
+        $idShop = $shops[$_GET['shop']];
+        $out += FetchSyncContext::forShop($idShop, function () {
+            return e2e_full_sync();
+        });
+        break;
+
+    case 'ms_break_key':
+        // Shop B's secret stops working (or works again).
+        $shops = ms_shops();
+        FetchSyncSettings::withShop($shops['B'], function () {
+            FetchSyncSettings::update(array('client_secret' => 'bad' === $_GET['to'] ? 'not-the-secret' : 'secret-2'));
+            FetchSyncApi::forgetToken();
+            FetchSyncSettings::setInternal('BACKOFF_UNTIL', 0);
+        });
+        $db->execute('UPDATE ' . _DB_PREFIX_ . 'fetchsync_queue SET next_try = 0, attempts = 0');
+        break;
+
+    case 'ms_overview':
+        Shop::setContext(Shop::CONTEXT_ALL);
+        $admin = new FetchSyncAdmin($module);
+        $out['context_shop'] = FetchSyncAdmin::contextShop();
+        $html = $admin->overview();
+        $out['rows'] = array();
+        if (preg_match_all('~<tr data-shop="(\d+)">(.*?)</tr>~s', $html, $m, PREG_SET_ORDER)) {
+            foreach ($m as $row) {
+                $cells = array();
+                preg_match_all('~<td[^>]*>(.*?)</td>~s', $row[2], $c);
+                foreach ($c[1] as $cell) {
+                    $cells[] = trim(preg_replace('/\s+/', ' ', html_entity_decode(strip_tags($cell), ENT_QUOTES, 'UTF-8')));
+                }
+                $out['rows'][(int) $row[1]] = $cells;
+            }
+        }
+        $out['edit_links'] = preg_match_all('~setShopContext=s-\d+~', $html);
+        break;
+
+    case 'upgrade':
+        // What PrestaShop does after new module files are in place: run the upgrade scripts.
+        $module = Module::getInstanceByName('fetchsync');
+        $module->installed = true;
+        $module->database_version = (string) $db->getValue('SELECT version FROM ' . _DB_PREFIX_ . 'module WHERE name = \'fetchsync\'');
+        $out['from'] = $module->database_version;
+        $out['needed'] = (bool) Module::initUpgradeModule($module);
+        $result = $module->runUpgradeModule();
+        $out['success'] = (bool) $result['success'];
+        $out['upgraded_to'] = $result['upgraded_to'];
+        $out['version'] = (string) $db->getValue('SELECT version FROM ' . _DB_PREFIX_ . 'module WHERE name = \'fetchsync\'');
+        $out['active'] = (bool) $db->getValue('SELECT active FROM ' . _DB_PREFIX_ . 'module WHERE name = \'fetchsync\'');
+        break;
+
+    case 'schema':
+        foreach (array('fetchsync_queue', 'fetchsync_deactivation', 'fetchsync_product', 'fetchsync_order', 'fetchsync_log') as $table) {
+            $out['id_shop'][$table] = (bool) $db->executeS('SHOW COLUMNS FROM ' . _DB_PREFIX_ . $table . ' LIKE \'id_shop\'');
+            $out['keys'][$table] = array_values(array_unique(array_column($db->executeS('SHOW INDEX FROM ' . _DB_PREFIX_ . $table . ' WHERE Key_name = \'PRIMARY\''), 'Column_name')));
+        }
+        $out['product_rows'] = $db->executeS('SELECT id_shop, id_product, ref FROM ' . _DB_PREFIX_ . 'fetchsync_product ORDER BY id_product');
+        $out['order_rows'] = $db->executeS('SELECT id_shop, fetch_order_id, id_order FROM ' . _DB_PREFIX_ . 'fetchsync_order');
+        $out['hooked'] = in_array('actionShopDataDuplication', array_column($db->executeS('SELECT h.name FROM ' . _DB_PREFIX_ . 'hook_module hm INNER JOIN ' . _DB_PREFIX_ . 'hook h ON h.id_hook = hm.id_hook WHERE hm.id_module = ' . (int) Module::getModuleIdByName('fetchsync')), 'name'), true);
         break;
 
     case 'state':

@@ -12,6 +12,11 @@
  * its own ref (the combination reference), "Product – Black / M" as the name,
  * its own price, stock, barcode and images, and the product's description,
  * summary, brand, category, tags, features (specs) and SEO meta.
+ *
+ * Everything is mapped for one shop: the shop of FetchSyncSettings (its
+ * markup, frozen refs, language and whether the product is on sale there),
+ * with PrestaShop's context switched to that shop (FetchSyncContext::forShop)
+ * so prices, taxes, specific prices, stock and image URLs are that shop's.
  */
 if (!defined('_PS_VERSION_')) {
     exit;
@@ -21,7 +26,7 @@ class FetchSyncProductMapper
 {
     const TABLE = 'fetchsync_product';
 
-    /** @var array<int,array<int,string>> id_product → id_product_attribute → frozen ref */
+    /** @var array<int,array<int,array<int,string>>> id_shop → id_product → id_product_attribute → frozen ref */
     private static $refs = array();
 
     /** Product types we can express on Fetch: standard products and products with combinations. */
@@ -33,9 +38,26 @@ class FetchSyncProductMapper
             && Product::PTYPE_SIMPLE === (int) $product->getType();
     }
 
-    public static function loadProduct($idProduct)
+    /** The product as $idShop (default: the shop of PrestaShop's context) has it. */
+    public static function loadProduct($idProduct, $idShop = null)
     {
-        return new Product((int) $idProduct, false, FetchSyncSettings::defaultLangId(), FetchSyncSettings::defaultShopId());
+        return new Product((int) $idProduct, false, FetchSyncSettings::defaultLangId(), null !== $idShop ? (int) $idShop : self::dataShop());
+    }
+
+    /** True when the product is in this shop's catalogue (product_shop). */
+    public static function inShop($idProduct, $idShop)
+    {
+        return (bool) Db::getInstance()->getValue(
+            'SELECT 1 FROM `' . _DB_PREFIX_ . 'product_shop` WHERE `id_product` = ' . (int) $idProduct . ' AND `id_shop` = ' . (int) $idShop
+        );
+    }
+
+    /** The shop PrestaShop's context is in: prices, stock and URLs come from it. */
+    private static function dataShop()
+    {
+        $shop = Context::getContext()->shop;
+
+        return $shop && $shop->id ? (int) $shop->id : FetchSyncSettings::shopId();
     }
 
     /**
@@ -189,12 +211,12 @@ class FetchSyncProductMapper
         );
     }
 
-    /** True once Fetch has accepted this product, or any of its combinations. */
+    /** True once this shop's Fetch store has accepted this product, or any of its combinations. */
     public static function wasSynced($idProduct, $idProductAttribute = null)
     {
         return (bool) Db::getInstance()->getValue(
             'SELECT 1 FROM `' . _DB_PREFIX_ . self::TABLE . '`
-            WHERE `id_product` = ' . (int) $idProduct
+            WHERE `id_shop` = ' . FetchSyncSettings::shopId() . ' AND `id_product` = ' . (int) $idProduct
             . (null !== $idProductAttribute ? ' AND `id_product_attribute` = ' . (int) $idProductAttribute : '') . '
             AND `fetch_product_id` <> \'\''
         );
@@ -312,21 +334,23 @@ class FetchSyncProductMapper
         return function_exists('mb_substr') ? mb_substr($text, 0, $length, 'UTF-8') : substr($text, 0, $length);
     }
 
-    /** @return array<int,string> */
+    /** @return array<int,string> this shop's frozen refs of the product */
     private static function frozenRefs($idProduct)
     {
         $idProduct = (int) $idProduct;
-        if (!isset(self::$refs[$idProduct])) {
-            self::$refs[$idProduct] = array();
+        $idShop = FetchSyncSettings::shopId();
+        if (!isset(self::$refs[$idShop][$idProduct])) {
+            self::$refs[$idShop][$idProduct] = array();
             $rows = Db::getInstance()->executeS(
-                'SELECT `id_product_attribute`, `ref` FROM `' . _DB_PREFIX_ . self::TABLE . '` WHERE `id_product` = ' . $idProduct
+                'SELECT `id_product_attribute`, `ref` FROM `' . _DB_PREFIX_ . self::TABLE . '`
+                WHERE `id_shop` = ' . $idShop . ' AND `id_product` = ' . $idProduct
             );
             foreach (is_array($rows) ? $rows : array() as $row) {
-                self::$refs[$idProduct][(int) $row['id_product_attribute']] = (string) $row['ref'];
+                self::$refs[$idShop][$idProduct][(int) $row['id_product_attribute']] = (string) $row['ref'];
             }
         }
 
-        return self::$refs[$idProduct];
+        return self::$refs[$idShop][$idProduct];
     }
 
     /** @return array<int,array{reference:string,ean13:string,upc:string,isbn:string,values:string[]}> */
@@ -352,19 +376,19 @@ class FetchSyncProductMapper
         return $out;
     }
 
-    /** Active, visible somewhere, orderable and in the default shop. */
+    /** Active, visible somewhere and orderable in this shop. */
     private static function isActive(Product $product)
     {
         return (bool) $product->active
             && 'none' !== $product->visibility
             && (bool) $product->available_for_order
-            && $product->isAssociatedToShop(FetchSyncSettings::defaultShopId());
+            && $product->isAssociatedToShop(FetchSyncSettings::shopId());
     }
 
     /**
      * price / salePrice / stockCount for a product or a combination. Prices are
-     * what an anonymous visitor in the shop's default country pays, VAT
-     * included, plus the configured markup.
+     * what an anonymous visitor in the shop's default country pays, in the
+     * shop's default currency, VAT included, plus the shop's markup.
      */
     private static function priceAndStock($idProduct, $idProductAttribute)
     {
@@ -389,17 +413,16 @@ class FetchSyncProductMapper
     private static function price($idProduct, $idProductAttribute, $withReductions)
     {
         $specificPrice = null;
-        $country = (int) Configuration::get('PS_COUNTRY_DEFAULT');
 
         return (float) Product::priceCalculation(
-            FetchSyncSettings::defaultShopId(),
+            self::dataShop(),
             (int) $idProduct,
             (int) $idProductAttribute,
-            $country,
+            FetchSyncSettings::countryId(),
             0,
             '',
-            (int) Configuration::get('PS_CURRENCY_DEFAULT'),
-            (int) Configuration::get('PS_UNIDENTIFIED_GROUP'),
+            FetchSyncSettings::currencyId(),
+            FetchSyncSettings::shopConfig('PS_UNIDENTIFIED_GROUP'),
             1,
             true,
             6,
@@ -412,16 +435,17 @@ class FetchSyncProductMapper
     }
 
     /**
-     * With stock management on: the available quantity (never negative).
+     * With stock management on: the available quantity (never negative), the
+     * shop's own or its group's when the group shares stock.
      * With it off: omitted, so Fetch sells the product without a stock limit.
      */
     private static function stock($idProduct, $idProductAttribute)
     {
-        if (!Configuration::get('PS_STOCK_MANAGEMENT')) {
+        if (!FetchSyncSettings::shopConfig('PS_STOCK_MANAGEMENT')) {
             return null;
         }
 
-        return max(0, (int) StockAvailable::getQuantityAvailableByProduct((int) $idProduct, (int) $idProductAttribute, FetchSyncSettings::defaultShopId()));
+        return max(0, (int) StockAvailable::getQuantityAvailableByProduct((int) $idProduct, (int) $idProductAttribute, self::dataShop()));
     }
 
     /** Description, summary, brand, category, tags, specs and SEO, shared by a product's combinations. */
@@ -463,12 +487,14 @@ class FetchSyncProductMapper
     }
 
     /**
-     * The product's default category as "Parent > Child" (Root and Home left
-     * out); the deepest of its categories when the default is Home.
+     * The product's default category as "Parent > Child" (Root and Home, and
+     * the shop's own root category, left out); the deepest of its categories
+     * when the default is Home.
      */
     private static function categoryPath(Product $product, $idLang)
     {
-        $top = array((int) Configuration::get('PS_ROOT_CATEGORY'), (int) Configuration::get('PS_HOME_CATEGORY'), 0);
+        $shop = Context::getContext()->shop;
+        $top = array((int) Configuration::get('PS_ROOT_CATEGORY'), (int) Configuration::get('PS_HOME_CATEGORY'), $shop ? (int) $shop->id_category : 0, 0);
         $id = (int) $product->id_category_default;
         if (in_array($id, $top, true)) {
             $id = 0;

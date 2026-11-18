@@ -6,6 +6,10 @@
  * Fetch signs every delivery: `X-Fetch-Signature: t=<unix seconds>,v1=<hex>`
  * where v1 = HMAC-SHA256(secret, "<t>.<raw body>"). Deliveries older than five
  * minutes are refused so a captured request cannot be replayed.
+ *
+ * With multistore one URL serves every shop, whatever domain it is called
+ * on: a delivery goes to the shop connected to the payload's Fetch storeId
+ * and must be signed with that shop's secret.
  */
 if (!defined('_PS_VERSION_')) {
     exit;
@@ -18,9 +22,10 @@ class FetchSyncWebhook
     /** Fetch retries for about 22 hours; remember event ids for a week. */
     const KEEP_SECONDS = 604800;
 
+    /** This shop's webhook URL, on the shop's own domain. */
     public static function url()
     {
-        return Context::getContext()->link->getModuleLink('fetchsync', 'webhook', array(), null, FetchSyncSettings::defaultLangId(), FetchSyncSettings::defaultShopId());
+        return Context::getContext()->link->getModuleLink('fetchsync', 'webhook', array(), null, FetchSyncSettings::defaultLangId(), FetchSyncSettings::shopId());
     }
 
     /**
@@ -28,12 +33,27 @@ class FetchSyncWebhook
      */
     public static function handle($raw, $signatureHeader)
     {
-        $secret = (string) FetchSyncSettings::get('webhook_secret');
-        if ('' === $secret || !self::verify((string) $signatureHeader, (string) $raw, $secret, time())) {
+        $raw = (string) $raw;
+        $signatureHeader = (string) $signatureHeader;
+        // Read only to choose the shop; that shop's secret then decides.
+        $payload = json_decode($raw, true);
+        $idShop = self::shopFor(is_array($payload) ? $payload : array());
+        if (!$idShop) {
+            // Not a store of this installation: acknowledge a delivery any shop signed, so Fetch stops retrying.
+            foreach (FetchSyncSettings::connectedShopIds() as $candidate) {
+                $secret = (string) FetchSyncSettings::getFor($candidate, 'webhook_secret');
+                if ('' !== $secret && self::verify($signatureHeader, $raw, $secret, time())) {
+                    return array(200, array('ok' => true, 'ignored' => 'store not connected'));
+                }
+            }
+
+            return array(401, array('error' => 'invalid signature'));
+        }
+        $secret = (string) FetchSyncSettings::getFor($idShop, 'webhook_secret');
+        if ('' === $secret || !self::verify($signatureHeader, $raw, $secret, time())) {
             return array(401, array('error' => 'invalid signature'));
         }
 
-        $payload = json_decode($raw, true);
         if (!is_array($payload) || empty($payload['event']) || empty($payload['data']) || !is_array($payload['data'])) {
             return array(400, array('error' => 'invalid payload'));
         }
@@ -43,14 +63,61 @@ class FetchSyncWebhook
             return array(200, array('ok' => true, 'duplicate' => true));
         }
 
-        if (0 === strpos((string) $payload['event'], 'order.') && FetchSyncSettings::enabled('import_orders')) {
-            FetchSyncOrderSync::import($payload['data']);
-        }
+        FetchSyncContext::forShop($idShop, function () use ($payload) {
+            if (0 === strpos((string) $payload['event'], 'order.') && FetchSyncSettings::enabled('import_orders')) {
+                FetchSyncOrderSync::import($payload['data']);
+            }
+        });
         if ('' !== $eventId) {
             self::remember($eventId);
         }
 
-        return array(200, array('ok' => true));
+        return array(200, array('ok' => true, 'shop' => $idShop));
+    }
+
+    /**
+     * The connected shop a delivery is for: the one linked to its storeId, or
+     * the only connected shop when the delivery names no store. 0 for none.
+     */
+    public static function shopFor(array $payload)
+    {
+        $storeId = isset($payload['data']['storeId']) && is_scalar($payload['data']['storeId']) ? (string) $payload['data']['storeId'] : '';
+        if ('' !== $storeId) {
+            $shops = FetchSyncSettings::shopsForStore($storeId);
+
+            return $shops ? (int) $shops[0] : 0;
+        }
+        $connected = FetchSyncSettings::connectedShopIds();
+
+        return 1 === count($connected) ? (int) $connected[0] : 0;
+    }
+
+    /**
+     * After registering a webhook with a key: the key has one endpoint and
+     * one signing secret at Fetch, so every shop using the same key on the
+     * same server gets the new secret too.
+     *
+     * @return int[] the other shops that were updated
+     */
+    public static function shareSecret($idShop, $secret, $registeredAt)
+    {
+        $key = FetchSyncSettings::withShop($idShop, function () {
+            return array(FetchSyncSettings::baseUrl(), (string) FetchSyncSettings::get('client_id'));
+        });
+        $updated = array();
+        foreach (FetchSyncSettings::shopIds() as $other) {
+            if ($other === (int) $idShop) {
+                continue;
+            }
+            FetchSyncSettings::withShop($other, function () use ($key, $secret, $registeredAt, $other, &$updated) {
+                if ('' !== $key[1] && FetchSyncSettings::baseUrl() === $key[0] && (string) FetchSyncSettings::get('client_id') === $key[1]) {
+                    FetchSyncSettings::update(array('webhook_secret' => $secret, 'webhook_registered' => $registeredAt));
+                    $updated[] = $other;
+                }
+            });
+        }
+
+        return $updated;
     }
 
     /** Constant-time check of a `t=…,v1=…` header against the raw body. */
