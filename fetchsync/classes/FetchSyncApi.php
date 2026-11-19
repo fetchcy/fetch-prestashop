@@ -12,7 +12,7 @@ if (!defined('_PS_VERSION_')) {
 
 class FetchSyncApi
 {
-    const VERSION = '1.3.0';
+    const VERSION = '1.3.1';
 
     /** @var string */
     private $baseUrl;

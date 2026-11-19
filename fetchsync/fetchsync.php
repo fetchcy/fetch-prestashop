@@ -52,7 +52,7 @@ class Fetchsync extends PaymentModule
     {
         $this->name = 'fetchsync';
         $this->tab = 'market_place';
-        $this->version = '1.3.0';
+        $this->version = '1.3.1';
         $this->author = 'Fetch';
         $this->need_instance = 0;
         $this->bootstrap = true;

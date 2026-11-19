@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.1 (beta)
+
+- **Exclude backorder items.** A new setting, on by default and set per shop.
+  A product or combination that PrestaShop would sell when it is out of stock (stock management on, quantity 0 or less, out-of-stock orders allowed by the product or by the shop) is sent to Fetch with stock 0 and is not created as a new product on Fetch.
+  One that is already on Fetch keeps being updated, so it drops to 0 and comes back when stock returns.
+  It applies to full and single-product syncs, stock changes from orders, combinations and every shop of a multistore.
+  In mirror mode, a backorder item that was never sent is switched off if it is on Fetch.
+  Changing the setting resends all products.
+- The upgrade from 1.3.0 turns the setting on and leaves every other setting as it was.
+
 ## 1.3.0 (beta)
 
 - **Multistore.** Every shop of a multistore installation can be connected to its own Fetch store, independently.

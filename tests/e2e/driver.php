@@ -160,6 +160,7 @@ function e2e_settings_post(array $extra)
         'fetchsync_prep_minutes' => (string) $s['prep_minutes'],
         'fetchsync_price_markup' => (string) FetchSyncSettings::markup(),
         'fetchsync_catalogue_mode' => $s['catalogue_mode'],
+        'fetchsync_exclude_backorders' => 'no' === $s['exclude_backorders'] ? '0' : '1',
     ), $extra);
 }
 
@@ -420,6 +421,7 @@ switch ($step) {
             'fetchsync_auto_accept' => '0',
             'fetchsync_prep_minutes' => '20',
             'fetchsync_price_markup' => '10 %',
+            'fetchsync_exclude_backorders' => '1',
         );
         $admin = new FetchSyncAdmin($module);
         $out['messages'] = array_map('strip_tags', $admin->process());
@@ -841,6 +843,113 @@ switch ($step) {
         $out['edit_links'] = preg_match_all('~setShopContext=s-\d+~', $html);
         break;
 
+    // --- Exclude backorder items ---------------------------------------------------------
+
+    case 'bo_create':
+        // A product with an out-of-stock behaviour (0 deny, 1 allow, 2 default), optionally with
+        // two combinations (quantities in "combos", e.g. "3,0"), flushed to Fetch.
+        $tax = e2e_tax_group();
+        $p = e2e_simple('Backorder ' . $_GET['ref'], (string) $_GET['ref'], 10.00, (int) $_GET['qty'], $tax);
+        if (!empty($_GET['combos'])) {
+            $lang = (int) Configuration::get('PS_LANG_DEFAULT');
+            foreach (explode(',', (string) $_GET['combos']) as $i => $qty) {
+                $colour = 0 === $i ? 'Black' : 'White';
+                $idAttribute = (int) $db->getValue(
+                    'SELECT a.id_attribute FROM ' . _DB_PREFIX_ . 'attribute a
+                    INNER JOIN ' . _DB_PREFIX_ . 'attribute_lang al ON al.id_attribute = a.id_attribute AND al.id_lang = ' . $lang . '
+                    WHERE al.name = \'' . pSQL($colour) . '\' ORDER BY a.id_attribute'
+                );
+                $ipa = $p->addCombinationEntity(0, 0, 0, 0, 0, 0, array(), $_GET['ref'] . '-' . strtoupper($colour), 0, '', 0 === $i);
+                $combination = new Combination((int) $ipa);
+                $combination->setAttributes(array($idAttribute));
+                StockAvailable::setQuantity((int) $p->id, (int) $ipa, (int) $qty);
+            }
+        }
+        StockAvailable::setProductOutOfStock((int) $p->id, (int) $_GET['oos']);
+        $out['id'] = (int) $p->id;
+        $out['sent'] = FetchSyncProductSync::flush(30);
+        $out['rows'] = $db->executeS('SELECT id_product_attribute AS ipa, ref, status FROM ' . _DB_PREFIX_ . 'fetchsync_product WHERE id_shop = ' . FetchSyncSettings::shopId() . ' AND id_product = ' . (int) $p->id . ' ORDER BY id_product_attribute');
+        break;
+
+    case 'bo_stock':
+        // New quantity (of a combination when "combo" is a reference), flushed.
+        $id = e2e_product_id((string) $_GET['ref']);
+        $ipa = !empty($_GET['combo']) ? e2e_ipa((string) $_GET['combo']) : 0;
+        StockAvailable::setQuantity($id, $ipa, (int) $_GET['qty']);
+        $out['sent'] = FetchSyncProductSync::flush(30);
+        break;
+
+    case 'bo_oos':
+        StockAvailable::setProductOutOfStock(e2e_product_id((string) $_GET['ref']), (int) $_GET['oos']);
+        FetchSyncProductSync::queue(e2e_product_id((string) $_GET['ref']));
+        $out['sent'] = FetchSyncProductSync::flush(30);
+        break;
+
+    case 'bo_config':
+        Configuration::updateValue((string) $_GET['name'], (string) $_GET['value']);
+        $out['value'] = Configuration::get((string) $_GET['name']);
+        break;
+
+    case 'bo_save':
+        // The settings form with "Exclude backorder items" on or off; a change resends the catalogue.
+        $_POST = e2e_settings_post(array('submitFetchsyncSave' => '1', 'fetchsync_exclude_backorders' => (string) $_GET['on']));
+        $out['messages'] = array_map(function ($html) {
+            return trim(preg_replace('/\s+/', ' ', strip_tags($html)));
+        }, (new FetchSyncAdmin($module))->process());
+        for ($i = 0; $i < 20 && FetchSyncSettings::internal('BULK_RUNNING'); ++$i) {
+            FetchSyncProductSync::flush(60);
+        }
+        $out['setting'] = FetchSyncSettings::get('exclude_backorders');
+        $out['finished'] = !FetchSyncSettings::internal('BULK_RUNNING');
+        break;
+
+    case 'bo_ms_create':
+        // One product in shops A, B and C: A allows orders (out_of_stock 1), B and C follow the shop's
+        // "allow ordering of out-of-stock products", which B refuses and C allows. All have no stock.
+        $shops = ms_shops();
+        $tax = e2e_tax_group();
+        $lang = (int) Configuration::get('PS_LANG_DEFAULT');
+        $p = new Product();
+        $p->name = array($lang => 'Backorder MS');
+        $p->link_rewrite = array($lang => 'backorder-ms');
+        $p->reference = 'BO-MS';
+        $p->price = round(10.00 / 1.19, 6);
+        $p->id_tax_rules_group = $tax;
+        $p->active = 1;
+        $p->visibility = 'both';
+        $p->available_for_order = 1;
+        $p->show_price = 1;
+        $p->id_category_default = (int) Configuration::get('PS_HOME_CATEGORY');
+        $p->id_shop_list = array_values($shops);
+        $p->add();
+        $p->addToCategories(array((int) Configuration::get('PS_HOME_CATEGORY')));
+        $groupC = (int) Shop::getGroupFromShop($shops['C']);
+        Configuration::updateValue('PS_ORDER_OUT_OF_STOCK', 0, false, (int) Shop::getGroupFromShop($shops['B']), $shops['B']);
+        Configuration::updateValue('PS_ORDER_OUT_OF_STOCK', 1, false, $groupC, $shops['C']);
+        Configuration::updateValue('PS_ORDER_OUT_OF_STOCK', 0, false, (int) Shop::getGroupFromShop($shops['A']), $shops['A']);
+        foreach ($shops as $idShop) {
+            StockAvailable::setQuantity((int) $p->id, 0, 0, $idShop);
+        }
+        StockAvailable::setProductOutOfStock((int) $p->id, 1, $shops['A']);
+        StockAvailable::setProductOutOfStock((int) $p->id, 2, $shops['B']);
+        StockAvailable::setProductOutOfStock((int) $p->id, 2, $shops['C']);
+        $out['id'] = (int) $p->id;
+        $out['shops'] = $shops;
+        $out['in_shop'] = array();
+        foreach ($shops as $key => $idShop) {
+            $out['in_shop'][$key] = FetchSyncProductMapper::inShop((int) $p->id, $idShop);
+        }
+        break;
+
+    case 'bo_ms_stock':
+        $shops = ms_shops();
+        StockAvailable::setQuantity(e2e_product_id('BO-MS'), 0, (int) $_GET['qty'], $shops[$_GET['shop']]);
+        break;
+
+    case 'bo_ms_rows':
+        $out['rows'] = $db->executeS('SELECT id_shop, ref, status FROM ' . _DB_PREFIX_ . 'fetchsync_product WHERE ref = \'BO-MS\' ORDER BY id_shop');
+        break;
+
     case 'upgrade':
         // What PrestaShop does after new module files are in place: run the upgrade scripts.
         $module = Module::getInstanceByName('fetchsync');
@@ -870,6 +979,7 @@ switch ($step) {
         unset($out['settings']['client_secret'], $out['settings']['webhook_secret']);
         $out['activity'] = FetchSyncLogger::activity(30);
         $out['queue'] = (int) $db->getValue('SELECT COUNT(*) FROM ' . _DB_PREFIX_ . 'fetchsync_queue');
+        $out['exclude_rows'] = $db->executeS('SELECT id_shop, value FROM ' . _DB_PREFIX_ . 'configuration WHERE name = \'FETCHSYNC_EXCLUDE_BACKORDERS\' ORDER BY id_shop');
         break;
 }
 echo json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);

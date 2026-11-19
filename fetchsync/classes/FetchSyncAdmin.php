@@ -137,7 +137,7 @@ class FetchSyncAdmin
                 break;
             default:
                 if ($resync) {
-                    $this->confirm('Settings saved. The price markup changed, so all products are being resent to Fetch.'
+                    $this->confirm('Settings saved. The ' . ('backorders' === $resync ? '"Exclude backorder items" setting' : 'price markup') . ' changed, so all products are being resent to Fetch.'
                         . (FetchSyncSettings::mirrorMode() ? ' Mirror mode runs when that full sync finishes.' : ''));
                 } elseif (!$mirrorBefore && FetchSyncSettings::mirrorMode()) {
                     $this->confirm('Settings saved. Mirror mode runs at the end of the next full sync: press "Sync all products now". Press "Preview" first to see what it would switch off.');
@@ -151,7 +151,7 @@ class FetchSyncAdmin
         }
     }
 
-    /** @return bool true when a changed price markup started a full resync */
+    /** @return string|false 'markup' or 'backorders' when that changed setting started a full resync */
     private function save()
     {
         $old = FetchSyncSettings::all();
@@ -179,6 +179,7 @@ class FetchSyncAdmin
             'prep_minutes' => max(0, min(180, (int) $get('prep_minutes'))),
             'price_markup' => (string) FetchSyncSettings::sanitizeMarkup($rawMarkup),
             'catalogue_mode' => FetchSyncSettings::sanitizeCatalogueMode($get('catalogue_mode')),
+            'exclude_backorders' => '1' === $get('exclude_backorders') ? 'yes' : 'no',
         );
         if (FetchSyncSettings::MODE_MIRROR !== $new['catalogue_mode']) {
             FetchSyncSettings::setInternal('MIRROR_PENDING', '');
@@ -226,14 +227,18 @@ class FetchSyncAdmin
 
         FetchSyncSettings::update($new);
 
-        // Every Fetch price depends on the markup, so resend the catalogue when it changes.
+        // Every Fetch price depends on the markup, and what is sold depends on the backorder rule: resend the catalogue when either changes.
         $oldMarkup = FetchSyncSettings::sanitizeMarkup($old['price_markup']);
-        if ((float) $new['price_markup'] === $oldMarkup || !FetchSyncSettings::isConnected() || 'yes' !== $new['sync_products']) {
+        $markupChanged = (float) $new['price_markup'] !== $oldMarkup;
+        $backordersChanged = $new['exclude_backorders'] !== ('no' === $old['exclude_backorders'] ? 'no' : 'yes');
+        if ((!$markupChanged && !$backordersChanged) || !FetchSyncSettings::isConnected() || 'yes' !== $new['sync_products']) {
             return false;
         }
-        FetchSyncProductSync::startBulkSync(sprintf('Price markup changed from %s%% to %s%%; resending all products', $oldMarkup, $new['price_markup']));
+        FetchSyncProductSync::startBulkSync($markupChanged
+            ? sprintf('Price markup changed from %s%% to %s%%; resending all products', $oldMarkup, $new['price_markup'])
+            : 'Exclude backorder items changed; resending all products');
 
-        return true;
+        return $markupChanged ? 'markup' : 'backorders';
     }
 
     private function connect()
@@ -624,6 +629,7 @@ class FetchSyncAdmin
                     'suffix' => '%',
                     'desc' => 'Added to every price and sale price sent to Fetch, e.g. 10 sends a €10.00 product as €11.00. Your PrestaShop prices are not changed.',
                 ),
+                $switch('exclude_backorders', 'Exclude backorder items', 'Products and combinations that PrestaShop would sell when out of stock (stock 0 or less, and ordering out-of-stock products allowed) are sent to Fetch with stock 0, so they show as out of stock, and are not added to Fetch as new products. One already on Fetch stays and comes back when stock returns.'),
                 array(
                     'type' => 'select',
                     'label' => 'Catalogue mode',
@@ -682,6 +688,7 @@ class FetchSyncAdmin
                 'fetchsync_sync_products' => 'yes' === $s['sync_products'] ? 1 : 0,
                 'fetchsync_price_markup' => (string) FetchSyncSettings::markup(),
                 'fetchsync_catalogue_mode' => FetchSyncSettings::sanitizeCatalogueMode($s['catalogue_mode']),
+                'fetchsync_exclude_backorders' => 'no' === $s['exclude_backorders'] ? 0 : 1,
                 'fetchsync_import_orders' => 'yes' === $s['import_orders'] ? 1 : 0,
                 'fetchsync_auto_accept' => 'yes' === $s['auto_accept'] ? 1 : 0,
                 'fetchsync_prep_minutes' => (int) $s['prep_minutes'],

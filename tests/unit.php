@@ -189,6 +189,34 @@ class Shop
     }
 }
 
+/** Stock as PrestaShop keeps it: quantity per [shop][product][combination], out_of_stock per [shop][product]. */
+class StockAvailable
+{
+    public static $quantity = array();
+    public static $outOfStock = array();
+
+    public static function getQuantityAvailableByProduct($idProduct, $ipa, $idShop)
+    {
+        return isset(self::$quantity[$idShop][$idProduct][$ipa]) ? self::$quantity[$idShop][$idProduct][$ipa] : 0;
+    }
+
+    public static function outOfStock($idProduct, $idShop)
+    {
+        return isset(self::$outOfStock[$idShop][$idProduct]) ? self::$outOfStock[$idShop][$idProduct] : 2;
+    }
+}
+
+class Context
+{
+    public $shop;
+    private static $instance;
+
+    public static function getContext()
+    {
+        return self::$instance ? self::$instance : (self::$instance = new self());
+    }
+}
+
 $dir = __DIR__ . '/../fetchsync/classes/';
 require $dir . 'FetchSyncSettings.php';
 require $dir . 'FetchSyncOrderMapper.php';
@@ -812,6 +840,73 @@ check('single shop: a delivery without storeId goes to the shop', FetchSyncWebho
 check('single shop: another store on the same key is acknowledged, not imported', FetchSyncWebhook::handle($delivery('store-7'), $signed($delivery('store-7'), 'whsec_test')), array(200, array('ok' => true, 'ignored' => 'store not connected')));
 check('single shop: wrong secret → 401', FetchSyncWebhook::handle($delivery('store-1'), $signed($delivery('store-1'), 'other'))[0], 401);
 Configuration::reset();
+
+// --- Exclude backorder items ----------------------------------------------------------------------
+// PrestaShop's rule: out_of_stock 1 allows orders, 0 refuses, 2 follows PS_ORDER_OUT_OF_STOCK.
+foreach (array(0 => array(false, false), 1 => array(true, true), 2 => array(false, true)) as $outOfStock => $expect) {
+    foreach (array(0, 1) as $shopAllows) {
+        $want = 2 === $outOfStock ? (bool) $shopAllows : $expect[0];
+        check("backorder rule: out_of_stock $outOfStock, shop allows $shopAllows", FetchSyncProductMapper::allowsBackorder($outOfStock, $shopAllows), $want);
+    }
+}
+Configuration::reset();
+Shop::$active = false;
+Configuration::$values['PS_SHOP_DEFAULT'] = '1';
+Configuration::$values['PS_STOCK_MANAGEMENT'] = '1';
+Context::getContext()->shop = (object) array('id' => 1);
+check('exclude_backorders is on by default', FetchSyncSettings::get('exclude_backorders'), 'yes');
+$matrix = function ($outOfStock, $allows, $quantity, $ipa = 0) {
+    Configuration::$values['PS_ORDER_OUT_OF_STOCK'] = (string) $allows;
+    StockAvailable::$outOfStock = array(1 => array(7 => $outOfStock));
+    StockAvailable::$quantity = array(1 => array(7 => array($ipa => $quantity)));
+
+    return FetchSyncProductMapper::backorder(7, $ipa);
+};
+foreach (array(0, 1, 2) as $oos) {
+    foreach (array(0, 1) as $allows) {
+        foreach (array(-3, 0, 1, 5) as $qty) {
+            $want = $qty <= 0 && (2 === $oos ? (bool) $allows : (bool) $oos);
+            check("backorder: out_of_stock $oos, shop allows $allows, quantity $qty", $matrix($oos, $allows, $qty), $want);
+        }
+    }
+}
+check('backorder: a combination follows its own quantity', array($matrix(1, 0, 0, 12), $matrix(1, 0, 4, 12)), array(true, false));
+check('backorder: the product setting 0 beats a shop that allows orders', $matrix(0, 1, 0), false);
+FetchSyncSettings::update(array('exclude_backorders' => 'no'));
+check('backorder: setting off excludes nothing', $matrix(1, 1, 0), false);
+FetchSyncSettings::update(array('exclude_backorders' => 'yes'));
+Configuration::$values['PS_STOCK_MANAGEMENT'] = '0';
+check('backorder: stock management off excludes nothing', $matrix(1, 1, 0), false);
+Configuration::$values['PS_STOCK_MANAGEMENT'] = '1';
+$stock = new ReflectionMethod('FetchSyncProductMapper', 'stock');
+if (PHP_VERSION_ID < 80100) {
+    $stock->setAccessible(true);
+}
+check('stock: a backorder item is sent as 0', $stock->invoke(null, 7, 0), 0) ;
+$matrix(1, 0, -4);
+check('stock: negative stock is sent as 0', $stock->invoke(null, 7, 0), 0);
+$matrix(1, 0, 6);
+check('stock: in stock is sent as is', $stock->invoke(null, 7, 0), 6);
+// Multistore: each shop reads its own out-of-stock setting and PS_ORDER_OUT_OF_STOCK.
+Shop::$active = true;
+Context::getContext()->shop = (object) array('id' => 2);
+Configuration::$shopValues = array(1 => array('PS_ORDER_OUT_OF_STOCK' => '1'), 2 => array('PS_ORDER_OUT_OF_STOCK' => '0'));
+Configuration::$shopValues[1]['FETCHSYNC_EXCLUDE_BACKORDERS'] = 'yes';
+Configuration::$shopValues[2]['FETCHSYNC_EXCLUDE_BACKORDERS'] = 'yes';
+StockAvailable::$outOfStock = array(1 => array(7 => 2), 2 => array(7 => 2));
+StockAvailable::$quantity = array(1 => array(7 => array(0 => 0)), 2 => array(7 => array(0 => 0)));
+$inShop = function ($idShop) {
+    Context::getContext()->shop = (object) array('id' => $idShop);
+
+    return FetchSyncSettings::withShop($idShop, function () {
+        return FetchSyncProductMapper::backorder(7, 0);
+    });
+};
+check('multistore: shop 1 allows orders (backorder), shop 2 does not', array($inShop(1), $inShop(2)), array(true, false));
+Configuration::$shopValues[1]['FETCHSYNC_EXCLUDE_BACKORDERS'] = 'no';
+check('multistore: the setting is per shop', array($inShop(1), $inShop(2)), array(false, false));
+Configuration::reset();
+Shop::$active = false;
 
 echo "$passes passed, $failures failed\n";
 exit($failures ? 1 : 0);

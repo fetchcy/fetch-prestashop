@@ -85,6 +85,7 @@ class FetchSyncSettings
             'prep_minutes' => 15,
             'price_markup' => '0',
             'catalogue_mode' => self::MODE_ADD,
+            'exclude_backorders' => 'yes',
             'webhook_secret' => '',
             'webhook_registered' => '',
             'cron_token' => '',
